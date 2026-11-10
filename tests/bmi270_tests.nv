@@ -1,0 +1,1496 @@
+// bmi270_tests: the driver over a double of the part, on the host.
+//
+// The double models a BMI270 at register level and sits behind an I2C bus,
+// an SPI bus and the chip-select pin, so the driver's own transactions,
+// the I2C register address and the SPI address bit and dummy byte, run
+// against it.  It does what the data sheet (BST-BMI270-DS000-08) says the
+// part does:
+//
+//   - CHIP_ID reads 0x24, and the registers reset to Table "Register Map"
+//     defaults at power-up and after the command 0xB6;
+//   - the configuration file goes to INIT_DATA, whose address is trapped,
+//     at the byte index set in INIT_ADDR_0 and INIT_ADDR_1 in words, and
+//     INTERNAL_STATUS.message reads 1 only if INIT_CTRL was written 0,
+//     then every byte of the file arrived in place, then INIT_CTRL was
+//     written 1 (section 4.4); with a byte wrong it reads 2;
+//   - on SPI, the first read after power-up or a reset is invalid and the
+//     part ignores writes until it has seen one (section 6.3), a read
+//     returns a dummy byte before the register bytes (section 6.4), and
+//     bit 7 of the address byte is set for a read;
+//   - in advanced power save mode (PWR_CONF bit 0) a write that comes
+//     less than 450 us after the previous one is dropped and counted
+//     (Table 19, section 4.5);
+//   - the FIFO_DATA register pops bytes, and reading past the fill level
+//     returns an uninitialised frame.
+//
+// A timer double advances the part's clock, so the driver's waits are
+// visible to the part.  The write log holds every write as `register,
+// count, bytes...`.  The numbers in the conversion tests are the data
+// sheet's: Table 2 (16384, 8192, 4096 and 2048 LSB/g), Table 3 (16.384
+// to 262.144 LSB/dps) and section 4.6.14 (the temperature).
+
+use std.test
+use embedded_hal.{ I2cBus, SpiBus, GpioOut, Timer, BoardI2c, BoardSpi, BoardGpio }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_gyro.{ GyroRange, Gyroscope }
+use dev_imu.{ Imu }
+use dev_thermo.{ Thermometer }
+use dev_id.{ Identifiable }
+use bmi270
+use bmi270.{ BmiLink, PowerMode, Bmi270, Bmi270Spi, Bmi270Link }
+use bmi270_config.{ BMI270_CONFIG, CONFIG_LEN }
+
+// ── The part ─────────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    page1: HashMap<Int, Int>
+    blob: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    pay: HashMap<Int, Int>
+
+// Keys of the state map.
+let K_CLOCK = 0
+let K_LAST_WRITE = 1
+let K_VIOLATIONS = 2
+let K_AWAKE = 3
+let K_BURSTS = 4
+let K_MAXBURST = 5
+let K_BADADDR = 6
+let K_NEXT = 7
+let K_POLLS = 8
+let K_CORRUPT = 9
+let K_RESETS = 10
+let K_HEAD = 11
+let K_FLEN = 12
+let K_PAGE = 13
+let K_SPI = 14
+let K_SPI_POS = 15
+let K_SPI_CMD = 16
+let K_SPI_READ = 17
+let K_ST_SCALE = 18
+let K_ST_STATUS = 19
+let K_ST_AXES = 20
+let K_INIT_WRITES = 21
+let K_WAKES = 22
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn bump(m: HashMap<Int, Int>, k: Int)
+    m.insert(k, at(m, k) + 1)
+
+fn log_push(m: HashMap<Int, Int>, v: Int)
+    let n = at(m, -1)
+    m.insert(n, v)
+    m.insert(-1, n + 1)
+
+// The power-up state, for the bus the part is on.
+fn power_up(c: Chip, spi: Bool)
+    c.regs.clear()
+    c.page1.clear()
+    c.blob.clear()
+    c.regs.insert(0x00, 0x24)
+    c.regs.insert(0x03, 0x10)
+    c.regs.insert(0x23, 0x80)
+    c.regs.insert(0x40, 0xA8)
+    c.regs.insert(0x41, 0x02)
+    c.regs.insert(0x42, 0xA9)
+    c.regs.insert(0x43, 0x00)
+    c.regs.insert(0x48, 0x02)
+    c.regs.insert(0x49, 0x10)
+    c.regs.insert(0x45, 0x88)
+    c.regs.insert(0x7C, 0x03)
+    c.st.insert(K_PAGE, 0)
+    c.st.insert(K_NEXT, 0)
+    c.st.insert(K_LAST_WRITE, -100000)
+    c.st.insert(K_HEAD, 0)
+    c.st.insert(K_FLEN, 0)
+    if spi
+        c.st.insert(K_AWAKE, 0)
+    else
+        c.st.insert(K_AWAKE, 1)
+
+fn new_chip(spi: Bool) -> Chip
+    let c = Chip { regs: HashMap.new(), page1: HashMap.new(), blob: HashMap.new(), fifo: HashMap.new(), st: HashMap.new(), log: HashMap.new(), mute: HashMap.new(), deaf: HashMap.new(), pay: HashMap.new() }
+    c.st.insert(K_SPI, 0)
+    if spi
+        c.st.insert(K_SPI, 1)
+    power_up(c, spi)
+    c
+
+fn tick(c: Chip, us: Int)
+    c.st.insert(K_CLOCK, at(c.st, K_CLOCK) + us)
+
+// A 16-bit register pair, low byte first.
+fn put16(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v & 0xFF)
+    c.regs.insert(reg + 1, (v >> 8) & 0xFF)
+
+fn get16(c: Chip, reg: Int) -> Int
+    at(c.regs, reg) | (at(c.regs, reg + 1) << 8)
+
+// The base of INIT_DATA in bytes: INIT_ADDR in words, 4 bits and 8 bits.
+fn init_base(c: Chip) -> Int
+    (((at(c.regs, 0x5C) << 4) | (at(c.regs, 0x5B) & 0x0F)) * 2)
+
+// Whether the file in the part is the file, byte for byte.
+fn blob_ok(c: Chip) -> Bool
+    for i in 0..CONFIG_LEN
+        if at(c.blob, i) != BMI270_CONFIG[i]
+            return false
+    true
+
+fn soft_reset(c: Chip)
+    let spi = at(c.st, K_SPI) == 1
+    let clock = at(c.st, K_CLOCK)
+    power_up(c, spi)
+    c.st.insert(K_CLOCK, clock)
+    bump(c.st, K_RESETS)
+
+// The self-test's excitation of one axis in counts at +-16 g, 2048 a g.
+fn st_delta(c: Chip, axis: Int) -> Int
+    let en = at(c.regs, 0x6D) & 1
+    if en == 0
+        return 0
+    var mag = 0
+    if axis == 0
+        mag = 9 * 2048
+    if axis == 1
+        mag = -8 * 2048
+    if axis == 2
+        mag = 6 * 2048
+    mag = mag * (at(c.st, K_ST_SCALE) + 1) / 4
+    if (at(c.regs, 0x6D) & 0x04) != 0
+        return mag
+    0 - mag
+
+@tier(app)
+fn chip_write(c: Chip, reg: Int, data: [u8])
+    bump(c.st, K_INIT_WRITES)
+    if at(c.st, K_SPI) == 1 and at(c.st, K_AWAKE) == 0
+        return
+    if at(c.mute, reg) != 0
+        return
+    let now = at(c.st, K_CLOCK)
+    let aps = at(c.regs, 0x7C) & 1
+    if aps == 1 and now - at(c.st, K_LAST_WRITE) < 450
+        bump(c.st, K_VIOLATIONS)
+        return
+    c.st.insert(K_LAST_WRITE, now)
+    log_push(c.log, reg)
+    log_push(c.log, data.len())
+    for i in 0..data.len()
+        log_push(c.log, data[i] as Int)
+    if reg == 0x5E
+        let base = init_base(c)
+        if base != at(c.st, K_NEXT)
+            bump(c.st, K_BADADDR)
+        bump(c.st, K_BURSTS)
+        if data.len() > at(c.st, K_MAXBURST)
+            c.st.insert(K_MAXBURST, data.len())
+        for i in 0..data.len()
+            var b = data[i] as Int
+            if at(c.st, K_CORRUPT) == 1 and base + i == 4000
+                b = b ^ 0xFF
+            c.blob.insert(base + i, b)
+        c.st.insert(K_NEXT, base + data.len())
+        return
+    for i in 0..data.len()
+        let a = reg + i
+        let b = data[i] as Int
+        if a == 0x32 or a == 0x33
+            if at(c.st, K_PAGE) == 1
+                c.page1.insert(a, b)
+                continue
+        c.regs.insert(a, b)
+    let last = data[data.len() - 1] as Int
+    if reg == 0x59
+        if last == 0
+            c.blob.clear()
+            c.st.insert(K_NEXT, 0)
+            c.regs.insert(0x21, 0)
+        if last == 1
+            if blob_ok(c)
+                c.regs.insert(0x21, 1)
+            else
+                c.regs.insert(0x21, 2)
+    if reg == 0x2F
+        c.st.insert(K_PAGE, last & 7)
+    if reg == 0x7E
+        if last == 0xB6
+            soft_reset(c)
+        if last == 0xB0
+            c.st.insert(K_HEAD, at(c.st, K_FLEN))
+        if last == 0x02
+            c.regs.insert(0x6E, at(c.st, K_ST_AXES))
+            c.regs.insert(0x38, at(c.st, K_ST_STATUS) << 3)
+
+// Whether a read at `reg` is refused now.  A `deaf` value of 1 refuses
+// every read; a value n of 2 or more refuses from the nth read on.
+fn deaf_now(c: Chip, reg: Int) -> Bool
+    let d = at(c.deaf, reg)
+    if d == 0
+        return false
+    if d == 1
+        return true
+    let seen = at(c.st, 200 + reg)
+    c.st.insert(200 + reg, seen + 1)
+    seen >= d - 1
+
+// The byte `i` of a read that starts at `reg`.
+fn chip_byte(c: Chip, reg: Int, i: Int) -> Int
+    let a = reg + i
+    var b = at(c.regs, a)
+    if reg == 0x5E
+        b = at(c.blob, init_base(c) + i)
+    if reg == 0x26
+        let h = at(c.st, K_HEAD)
+        if h < at(c.st, K_FLEN)
+            b = at(c.fifo, h)
+            c.st.insert(K_HEAD, h + 1)
+        else
+            b = 0
+    if a == 0x24
+        b = (at(c.st, K_FLEN) - at(c.st, K_HEAD)) & 0xFF
+    if a == 0x25
+        b = ((at(c.st, K_FLEN) - at(c.st, K_HEAD)) >> 8) & 0x3F
+    if a == 0x21
+        if at(c.st, K_POLLS) > 0
+            c.st.insert(K_POLLS, at(c.st, K_POLLS) - 1)
+            b = 0
+    if a >= 0x0C and a <= 0x11 and reg != 0x5E
+        let axis = (a - 0x0C) / 2
+        let lo = (a - 0x0C) % 2
+        let v = (get16(c, 0x0C + axis * 2) + st_delta(c, axis)) & 0xFFFF
+        if lo == 0
+            b = v & 0xFF
+        else
+            b = v >> 8
+    b
+
+@tier(app)
+fn chip_read(c: Chip, reg: Int, n: Int) -> [u8]
+    tick(c, 20)
+    var out: [u8] = []
+    for i in 0..n
+        list.push(out, chip_byte(c, reg, i) as u8)
+    out
+
+// ── The buses ────────────────────────────────────────────────────────
+
+struct FakeI2c
+    c: Chip
+    addr: Int
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        pass
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.addr or data.len() == 0
+            return false
+        tick(self.c, 20)
+        var rest: [u8] = []
+        for i in 1..data.len()
+            list.push(rest, data[i])
+        if at(self.c.mute, data[0] as Int) != 0
+            return false
+        // A write of this value to this register is refused.
+        if data.len() > 1 and at(self.c.mute, 0x10000 + (data[0] as Int) * 256 + (data[1] as Int)) != 0
+            return false
+        chip_write(self.c, data[0] as Int, rest)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.addr
+            return None
+        if deaf_now(self.c, tx[0] as Int)
+            return None
+        Some(chip_read(self.c, tx[0] as Int, n))
+
+// The SPI bus and the chip-select pin share the part: the pin's edges
+// open and close a transaction, the bus moves its bytes.
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    @tier(app)
+    fn transfer(self, b: Int) -> Int [hw]
+        let c = self.c
+        let pos = at(c.st, K_SPI_POS)
+        c.st.insert(K_SPI_POS, pos + 1)
+        if pos == 0
+            c.st.insert(K_SPI_CMD, b)
+            if (b & 0x80) != 0
+                tick(c, 20)
+                // The first read after power-up or a reset is invalid.
+                c.st.insert(K_SPI_READ, 0)
+                if at(c.st, K_AWAKE) == 0
+                    c.st.insert(K_AWAKE, 1)
+                    c.st.insert(K_SPI_READ, 1)
+                    bump(c.st, K_WAKES)
+            return 0
+        let cmd = at(c.st, K_SPI_CMD)
+        if (cmd & 0x80) != 0
+            // The first byte of a read is the dummy, then the registers.
+            if pos == 1
+                return 0
+            if at(c.st, K_SPI_READ) == 1
+                return 0xFF
+            return chip_byte(c, cmd & 0x7F, pos - 2)
+        c.pay.insert(pos - 1, b)
+        0
+
+    fn write(self, data: [u8]) [hw]
+        pass
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        []
+
+struct FakePins
+    c: Chip
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        let c = self.c
+        if val == 0
+            c.st.insert(K_SPI_POS, 0)
+            c.pay.clear()
+        else
+            // CS rises: a write transaction commits its bytes.
+            let cmd = at(c.st, K_SPI_CMD)
+            let pos = at(c.st, K_SPI_POS)
+            if pos > 1 and (cmd & 0x80) == 0
+                var data: [u8] = []
+                for i in 0..(pos - 1)
+                    list.push(data, at(c.pay, i) as u8)
+                chip_write(c, cmd & 0x7F, data)
+            c.st.insert(K_SPI_POS, 0)
+            c.pay.clear()
+            c.st.insert(K_SPI_CMD, 0)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.c.st, 100 + pin)
+
+struct FakeTimer
+    c: Chip
+
+impl Timer for FakeTimer
+    fn delay_ms(self, ms: Int) [hw]
+        tick(self.c, ms * 1000)
+
+    fn delay_us(self, us: Int) [hw]
+        tick(self.c, us)
+
+    fn ticks_ms(self) -> Int [hw]
+        at(self.c.st, K_CLOCK) / 1000
+
+    fn ticks_us(self) -> Int [hw]
+        at(self.c.st, K_CLOCK)
+
+// The two links the tests drive: the driver's own transport functions
+// over the doubles.
+struct I2cTestLink
+    bus: FakeI2c
+    timer: FakeTimer
+    w: DeviceWiring
+
+impl BmiLink for I2cTestLink
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bmi270.i2c_read(self.bus, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        bmi270.i2c_write(self.bus, self.w, reg, src)
+
+    fn link_wait(self, us: Int) [hw]
+        self.timer.delay_us(us)
+
+    fn link_wake(self) [hw]
+        pass
+
+    fn link_chunk(self) -> Int [hw]
+        32
+
+struct SpiTestLink
+    bus: FakeSpi
+    pins: FakePins
+    timer: FakeTimer
+    w: DeviceWiring
+
+impl BmiLink for SpiTestLink
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bmi270.spi_read(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        bmi270.spi_write(self.bus, self.pins, self.w, reg, src)
+
+    fn link_wait(self, us: Int) [hw]
+        self.timer.delay_us(us)
+
+    fn link_wake(self) [hw]
+        bmi270.spi_wake(self.bus, self.pins, self.w)
+
+    fn link_chunk(self) -> Int [hw]
+        30
+
+fn i2c_link(c: Chip) -> I2cTestLink
+    I2cTestLink { bus: FakeI2c { c: c, addr: 0x68 }, timer: FakeTimer { c: c }, w: dev_bus.wiring_i2c(0, 0x68) }
+
+fn spi_link(c: Chip) -> SpiTestLink
+    SpiTestLink { bus: FakeSpi { c: c }, pins: FakePins { c: c }, timer: FakeTimer { c: c }, w: dev_bus.wiring_spi(0, 9) }
+
+// An I2C link to a part that is not there.
+fn absent_link(c: Chip) -> I2cTestLink
+    I2cTestLink { bus: FakeI2c { c: c, addr: 0x69 }, timer: FakeTimer { c: c }, w: dev_bus.wiring_i2c(0, 0x68) }
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_accelerometer_sensitivities_are_the_data_sheets() [io]
+    // Table 2: 16384, 8192, 4096 and 2048 LSB/g at +-2, 4, 8 and 16 g.
+    test.assert_eq(bmi270.accel_mg(16384, 0), 1000)
+    test.assert_eq(bmi270.accel_mg(8192, 1), 1000)
+    test.assert_eq(bmi270.accel_mg(4096, 2), 1000)
+    test.assert_eq(bmi270.accel_mg(2048, 3), 1000)
+    // Full scale is the count 32767 and -32768.
+    test.assert_eq(bmi270.accel_mg(32767, 0), 1999)
+    test.assert_eq(bmi270.accel_mg(0x8000, 0), -2000)
+    test.assert_eq(bmi270.accel_mg(0x8000, 3), -16000)
+    test.assert_eq(bmi270.accel_mg(0xFFFF, 1), 0)
+    test.assert_eq(bmi270.accel_mg(0xFC00, 2), -250)
+    // Only the low two bits of the range code count.
+    test.assert_eq(bmi270.accel_full_scale_mg(2), 8000)
+    test.assert_eq(bmi270.accel_full_scale_mg(6), 8000)
+
+@test
+fn test_gyroscope_sensitivities_are_the_data_sheets() [io]
+    // Table 3: 16.384, 32.768, 65.536, 131.072 and 262.144 LSB/dps.
+    test.assert_eq(bmi270.gyro_mdps(16384, 0), 1000000)
+    test.assert_eq(bmi270.gyro_mdps(32768 - 1, 0), 1999938)
+    test.assert_eq(bmi270.gyro_mdps(0x8000, 0), -2000000)
+    test.assert_eq(bmi270.gyro_mdps(0x8000, 1), -1000000)
+    test.assert_eq(bmi270.gyro_mdps(0x8000, 2), -500000)
+    test.assert_eq(bmi270.gyro_mdps(0x8000, 3), -250000)
+    test.assert_eq(bmi270.gyro_mdps(0xC000, 4), -62500)
+    test.assert_eq(bmi270.gyro_mdps(16384, 3), 125000)
+    // 131.072 LSB/dps: a count of 131 is 0.999 dps.
+    test.assert_eq(bmi270.gyro_mdps(131, 3), 999)
+    // The reserved codes read as 125 dps.
+    test.assert_eq(bmi270.gyro_full_scale_mdps(5), 125000)
+    test.assert_eq(bmi270.gyro_full_scale_mdps(7), 125000)
+
+@test
+fn test_temperature_follows_section_4_6_14() [io]
+    test.assert_eq(bmi270.temp_milli_c(0x0000) ?? -1, 23000)
+    test.assert_eq(bmi270.temp_milli_c(0x7FFF) ?? -1, 86998)
+    test.assert_eq(bmi270.temp_milli_c(0x8001) ?? -1, -40998)
+    test.assert(bmi270.temp_milli_c(0x8000) == None)
+    // 512 LSB per kelvin.
+    test.assert_eq(bmi270.temp_milli_c(512) ?? -1, 24000)
+    test.assert_eq(bmi270.temp_milli_c(0xFE00) ?? -1, 22000)
+
+@test
+fn test_output_data_rates_and_the_codes_for_a_request() [io]
+    // Section 5.2.41: 25/32, 25/16, 25/8, 25/4, 12.5, 25 ... 1600 Hz.
+    test.assert_eq(bmi270.acc_odr_mhz(1), 781)
+    test.assert_eq(bmi270.acc_odr_mhz(2), 1562)
+    test.assert_eq(bmi270.acc_odr_mhz(3), 3125)
+    test.assert_eq(bmi270.acc_odr_mhz(4), 6250)
+    test.assert_eq(bmi270.acc_odr_mhz(5), 12500)
+    test.assert_eq(bmi270.acc_odr_mhz(6), 25000)
+    test.assert_eq(bmi270.acc_odr_mhz(7), 50000)
+    test.assert_eq(bmi270.acc_odr_mhz(8), 100000)
+    test.assert_eq(bmi270.acc_odr_mhz(9), 200000)
+    test.assert_eq(bmi270.acc_odr_mhz(10), 400000)
+    test.assert_eq(bmi270.acc_odr_mhz(11), 800000)
+    test.assert_eq(bmi270.acc_odr_mhz(12), 1600000)
+    test.assert_eq(bmi270.acc_odr_mhz(0), -1)
+    test.assert_eq(bmi270.acc_odr_mhz(13), -1)
+    // Section 5.2.43: 25 Hz to 3200 Hz.
+    test.assert_eq(bmi270.gyr_odr_mhz(6), 25000)
+    test.assert_eq(bmi270.gyr_odr_mhz(9), 200000)
+    test.assert_eq(bmi270.gyr_odr_mhz(13), 3200000)
+    test.assert_eq(bmi270.gyr_odr_mhz(5), -1)
+    test.assert_eq(bmi270.gyr_odr_mhz(14), -1)
+    // The slowest rate at or above the request, per filter mode.
+    test.assert_eq(bmi270.acc_code_for(100000, true), 8)
+    test.assert_eq(bmi270.acc_code_for(101000, true), 9)
+    test.assert_eq(bmi270.acc_code_for(1, true), 5)
+    test.assert_eq(bmi270.acc_code_for(1, false), 1)
+    test.assert_eq(bmi270.acc_code_for(5000000, true), 12)
+    test.assert_eq(bmi270.acc_code_for(5000000, false), 10)
+    test.assert_eq(bmi270.gyr_code_for(1, true), 6)
+    test.assert_eq(bmi270.gyr_code_for(100000, false), 8)
+    test.assert_eq(bmi270.gyr_code_for(200000, false), 8)
+    test.assert_eq(bmi270.gyr_code_for(200000, true), 9)
+    test.assert_eq(bmi270.gyr_code_for(9000000, true), 13)
+
+@test
+fn test_range_codes_both_ways() [io]
+    test.assert_eq(bmi270.acc_range_code(AccelRange2g), 0)
+    test.assert_eq(bmi270.acc_range_code(AccelRange4g), 1)
+    test.assert_eq(bmi270.acc_range_code(AccelRange8g), 2)
+    test.assert_eq(bmi270.acc_range_code(AccelRange16g), 3)
+    test.assert(bmi270.acc_range_of(0) == AccelRange2g)
+    test.assert(bmi270.acc_range_of(1) == AccelRange4g)
+    test.assert(bmi270.acc_range_of(2) == AccelRange8g)
+    test.assert(bmi270.acc_range_of(3) == AccelRange16g)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange2000dps), 0)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange1000dps), 1)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange500dps), 2)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange250dps), 3)
+    test.assert(bmi270.gyr_range_of(0) == GyroRange2000dps)
+    test.assert(bmi270.gyr_range_of(1) == GyroRange1000dps)
+    test.assert(bmi270.gyr_range_of(2) == GyroRange500dps)
+    test.assert(bmi270.gyr_range_of(3) == GyroRange250dps)
+    // 125 dps has no value of the trait's enum; the narrowest above it.
+    test.assert(bmi270.gyr_range_of(4) == GyroRange250dps)
+
+// ── The configuration file ───────────────────────────────────────────
+
+@test
+fn test_the_file_is_the_one_in_the_sensor_api() [io]
+    test.assert_eq(BMI270_CONFIG.len(), 8192)
+    test.assert_eq(CONFIG_LEN, 8192)
+    // The first and last bytes, and the sum of all, of bmi270_config_file
+    // in bmi270.c v2.86.1.
+    test.assert_eq(BMI270_CONFIG[0], 0xc8)
+    test.assert_eq(BMI270_CONFIG[1], 0x2e)
+    test.assert_eq(BMI270_CONFIG[2], 0x00)
+    test.assert_eq(BMI270_CONFIG[8191], 0xc1)
+    var sum = 0
+    for i in 0..CONFIG_LEN
+        sum = sum + BMI270_CONFIG[i]
+        test.assert(BMI270_CONFIG[i] >= 0 and BMI270_CONFIG[i] <= 255)
+    test.assert_eq(sum, 670384)
+
+// ── Identity and start-up ────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_chip_id_0x24_on_both_buses() [io, hw]
+    let c = new_chip(false)
+    match bmi270.identify(i2c_link(c))
+        Some(id) =>
+            test.assert_eq(id.who, 0x24)
+            test.assert(id.rev == None)
+        None => test.assert(false)
+    let s = new_chip(true)
+    match bmi270.identify(spi_link(s))
+        Some(id) => test.assert_eq(id.who, 0x24)
+        None => test.assert(false)
+    // On SPI the first read woke the interface and the second was valid.
+    test.assert_eq(at(s.st, K_WAKES), 1)
+
+@test
+fn test_another_part_or_none_is_not_identified() [io, hw]
+    let c = new_chip(false)
+    c.regs.insert(0x00, 0x43)
+    test.assert(bmi270.identify(i2c_link(c)) == None)
+    test.assert(bmi270.identify(absent_link(new_chip(false))) == None)
+
+@test
+fn test_start_on_i2c_writes_the_file_in_32_byte_bursts() [io, hw]
+    let c = new_chip(false)
+    test.assert_eq(bmi270.start(i2c_link(c)), 0)
+    // Section 4.4: the file is in the part, byte for byte.
+    test.assert(blob_ok(c))
+    test.assert_eq(at(c.regs, 0x21), 1)
+    // 8192 / 32 bursts, none longer than 32, each at the address after
+    // the last, and no write was dropped for coming too soon.
+    test.assert_eq(at(c.st, K_BURSTS), 256)
+    test.assert_eq(at(c.st, K_MAXBURST), 32)
+    test.assert_eq(at(c.st, K_BADADDR), 0)
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+    // A soft reset ran, advanced power save is off, and the sensors are on.
+    test.assert_eq(at(c.st, K_RESETS), 1)
+    test.assert_eq(at(c.regs, 0x7C), 0x02)
+    test.assert_eq(at(c.regs, 0x7D), 0x0E)
+    test.assert_eq(at(c.regs, 0x59), 1)
+
+@test
+fn test_start_on_spi_wakes_the_interface_twice_and_writes_30_byte_bursts() [io, hw]
+    let c = new_chip(true)
+    test.assert_eq(bmi270.start(spi_link(c)), 0)
+    test.assert(blob_ok(c))
+    // 8192 = 273 x 30 + 2: 274 bursts, none longer than 30.
+    test.assert_eq(at(c.st, K_BURSTS), 274)
+    test.assert_eq(at(c.st, K_MAXBURST), 30)
+    test.assert_eq(at(c.st, K_BADADDR), 0)
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+    // The first read after power-up and the first after the reset.
+    test.assert_eq(at(c.st, K_WAKES), 2)
+    test.assert_eq(at(c.regs, 0x7D), 0x0E)
+    test.assert_eq(at(c.regs, 0x21), 1)
+
+@test
+fn test_the_init_sequence_order_is_the_data_sheets() [io, hw]
+    let c = new_chip(false)
+    test.assert_eq(bmi270.start(i2c_link(c)), 0)
+    // The log holds register, count, bytes...  The first writes are the
+    // soft reset, PWR_CONF with advanced power save off, INIT_CTRL 0.
+    test.assert_eq(at(c.log, 0), 0x7E)
+    test.assert_eq(at(c.log, 2), 0xB6)
+    test.assert_eq(at(c.log, 3), 0x7C)
+    test.assert_eq(at(c.log, 5), 0x02)
+    test.assert_eq(at(c.log, 6), 0x59)
+    test.assert_eq(at(c.log, 8), 0x00)
+    // Then the address registers, two bytes at 0, and the first burst.
+    test.assert_eq(at(c.log, 9), 0x5B)
+    test.assert_eq(at(c.log, 10), 2)
+    test.assert_eq(at(c.log, 11), 0)
+    test.assert_eq(at(c.log, 12), 0)
+    test.assert_eq(at(c.log, 13), 0x5E)
+    test.assert_eq(at(c.log, 14), 32)
+    test.assert_eq(at(c.log, 15), 0xc8)
+    // The second burst starts at byte 32, word 16.
+    test.assert_eq(at(c.log, 13 + 2 + 32), 0x5B)
+    test.assert_eq(at(c.log, 13 + 2 + 32 + 3), 1)
+
+@test
+fn test_the_status_is_polled_until_the_message_reads_1() [io, hw]
+    let c = new_chip(false)
+    c.st.insert(K_POLLS, 7)
+    let before = at(c.st, K_CLOCK)
+    test.assert_eq(bmi270.start(i2c_link(c)), 0)
+    // Seven reads of 0 were answered, each followed by a 1 ms wait.
+    test.assert(at(c.st, K_POLLS) == 0)
+    test.assert(at(c.st, K_CLOCK) - before > 7000)
+
+@test
+fn test_start_refuses_what_it_cannot_bring_up() [io, hw]
+    // No part, and another part.
+    test.assert_eq(bmi270.start(absent_link(new_chip(false))), -1)
+    let c = new_chip(false)
+    c.regs.insert(0x00, 0x43)
+    test.assert_eq(bmi270.start(i2c_link(c)), -1)
+    // A write refused: the soft reset, then the later steps.
+    let m = new_chip(false)
+    m.mute.insert(0x7E, 1)
+    test.assert_eq(bmi270.start(i2c_link(m)), -2)
+    let p = new_chip(false)
+    p.mute.insert(0x7C, 1)
+    test.assert_eq(bmi270.start(i2c_link(p)), -2)
+    let i = new_chip(false)
+    i.mute.insert(0x59, 1)
+    test.assert_eq(bmi270.start(i2c_link(i)), -2)
+    let d = new_chip(false)
+    d.mute.insert(0x5E, 1)
+    test.assert_eq(bmi270.start(i2c_link(d)), -2)
+
+@test
+fn test_start_reports_a_file_the_part_did_not_take() [io, hw]
+    let c = new_chip(false)
+    c.st.insert(K_CORRUPT, 1)
+    // The message stays 2, init_err, for the whole 20 ms.
+    test.assert_eq(bmi270.start(i2c_link(c)), -3)
+    test.assert_eq(at(c.regs, 0x21), 2)
+
+@test
+fn test_start_stops_if_the_status_stops_answering() [io, hw]
+    let c = new_chip(false)
+    c.deaf.insert(0x21, 1)
+    test.assert_eq(bmi270.start(i2c_link(c)), -2)
+    test.assert(bmi270.init_message(i2c_link(c)) == None)
+
+@test
+fn test_start_stops_if_the_sensors_cannot_be_enabled() [io, hw]
+    let c = new_chip(false)
+    c.mute.insert(0x7D, 1)
+    test.assert_eq(bmi270.start(i2c_link(c)), -2)
+
+@test
+fn test_the_file_reads_back_and_a_wrong_byte_is_counted() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    // The sequence turns advanced power save off before the file goes in;
+    // the part drops a write that follows another inside 450 us otherwise.
+    test.assert(bmi270.reg_set(l, 0x7C, 0x02))
+    test.assert(bmi270.reg_set(l, 0x59, 0))
+    test.assert(bmi270.upload_config(l))
+    test.assert_eq(bmi270.verify_config(l), 0)
+    c.blob.insert(100, 0x55)
+    c.blob.insert(8000, 0x55)
+    test.assert_eq(bmi270.verify_config(l), 2)
+    // SPI reads it back in 30-byte pieces.
+    let s = new_chip(true)
+    let sl = spi_link(s)
+    bmi270.spi_wake(sl.bus, sl.pins, sl.w)
+    test.assert(bmi270.reg_set(sl, 0x7C, 0x02))
+    test.assert(bmi270.upload_config(sl))
+    test.assert_eq(bmi270.verify_config(sl), 0)
+    // A part that stops answering.
+    test.assert_eq(bmi270.verify_config(absent_link(new_chip(false))), -1)
+    test.assert(not bmi270.upload_config(absent_link(new_chip(false))))
+    let m = new_chip(false)
+    m.mute.insert(0x5E, 1)
+    test.assert(not bmi270.upload_config(i2c_link(m)))
+    m.deaf.insert(0x5E, 1)
+    test.assert_eq(bmi270.verify_config(i2c_link(m)), -1)
+    let a = new_chip(false)
+    a.mute.insert(0x5B, 1)
+    test.assert(not bmi270.upload_config(i2c_link(a)))
+    test.assert_eq(bmi270.verify_config(i2c_link(a)), -1)
+
+@test
+fn test_a_soft_reset_drops_the_file() [io, hw]
+    let c = new_chip(true)
+    let l = spi_link(c)
+    test.assert_eq(bmi270.start(l), 0)
+    test.assert(bmi270.soft_reset(l))
+    test.assert_eq(at(c.regs, 0x21), 0)
+    test.assert_eq(at(c.regs, 0x7C), 0x03)
+    // The interface is back on I2C and needs its first read again.
+    test.assert_eq(at(c.st, K_AWAKE), 1)
+    test.assert(not bmi270.soft_reset(absent_link(new_chip(false))))
+
+// ── The write gap in advanced power save ─────────────────────────────
+
+@test
+fn test_a_second_write_inside_450_us_is_dropped_by_the_part() [io, hw]
+    // The double's rule, on the bus itself: with advanced power save on, a
+    // write 100 us after another does not take.
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    var one: DevBytes = Vec.new()
+    let _ = one.push(0x03 as u8)
+    test.assert(l.link_write(0x41, one))
+    l.link_wait(100)
+    test.assert(l.link_write(0x43, one))
+    test.assert_eq(at(c.st, K_VIOLATIONS), 1)
+    test.assert_eq(at(c.regs, 0x43), 0)
+    l.link_wait(450)
+    test.assert(l.link_write(0x43, one))
+    test.assert_eq(at(c.regs, 0x43), 3)
+
+@test
+fn test_every_configuration_write_waits_450_us() [io, hw]
+    // Back to back through reg_set, in the part's power-up mode, which is
+    // advanced power save: none is dropped.
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert(bmi270.reg_set(l, 0x41, 0x00))
+    test.assert(bmi270.reg_set(l, 0x43, 0x01))
+    test.assert(bmi270.reg_set(l, 0x40, 0xA9))
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+    test.assert_eq(at(c.regs, 0x41), 0x00)
+    test.assert_eq(at(c.regs, 0x43), 0x01)
+    test.assert_eq(at(c.regs, 0x40), 0xA9)
+    // reg_modify is a read, a write and a wait.
+    test.assert_eq(bmi270.reg_modify(l, 0x40, 0x0F, 0x08), 0xA8)
+    test.assert_eq(bmi270.reg_modify(absent_link(c), 0x40, 0, 0), -1)
+    c.mute.insert(0x40, 1)
+    test.assert_eq(bmi270.reg_modify(l, 0x40, 0, 1), -1)
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+
+// ── Power modes ──────────────────────────────────────────────────────
+
+@test
+fn test_the_power_modes_set_the_bits_of_table_6() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert_eq(bmi270.start(l), 0)
+    // Low power: filters off, advanced power save on, both sensors on.
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeLowPower))
+    test.assert_eq(at(c.regs, 0x7C), 0x03)
+    test.assert_eq(at(c.regs, 0x7D), 0x0E)
+    test.assert_eq(at(c.regs, 0x40) & 0x80, 0)
+    test.assert_eq(at(c.regs, 0x42) & 0xC0, 0)
+    // The gyroscope's 200 Hz was held to the mode's 100 Hz.
+    test.assert_eq(at(c.regs, 0x42) & 0x0F, 8)
+    test.assert_eq(at(c.regs, 0x40) & 0x0F, 8)
+    // Normal: filters on, advanced power save off.
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeNormal))
+    test.assert_eq(at(c.regs, 0x7C), 0x02)
+    test.assert_eq(at(c.regs, 0x40) & 0x80, 0x80)
+    test.assert_eq(at(c.regs, 0x42) & 0xC0, 0x80)
+    // Performance: the gyroscope's noise bit too.
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModePerformance))
+    test.assert_eq(at(c.regs, 0x42) & 0xC0, 0xC0)
+    // Configuration and suspend: the sensors off.
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeConfiguration))
+    test.assert_eq(at(c.regs, 0x7C), 0x02)
+    test.assert_eq(at(c.regs, 0x7D), 0x00)
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeSuspend))
+    test.assert_eq(at(c.regs, 0x7C), 0x03)
+    test.assert_eq(at(c.regs, 0x7D), 0x00)
+    // No write came inside the gap of advanced power save.
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+
+@test
+fn test_the_rates_are_held_into_the_range_of_the_mode() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert_eq(bmi270.start(l), 0)
+    // A rate only low power has, 0.78 Hz, rises to normal mode's 12.5 Hz.
+    c.regs.insert(0x40, 0xA1)
+    c.regs.insert(0x42, 0xAD)
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeNormal))
+    test.assert_eq(at(c.regs, 0x40) & 0x0F, 5)
+    test.assert_eq(at(c.regs, 0x42) & 0x0F, 13)
+    // 1600 Hz and 3200 Hz fall to low power's 400 Hz and 100 Hz.
+    c.regs.insert(0x40, 0xAC)
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeLowPower))
+    test.assert_eq(at(c.regs, 0x40) & 0x0F, 10)
+    test.assert_eq(at(c.regs, 0x42) & 0x0F, 8)
+    // And a gyroscope rate below 25 Hz rises to 25 Hz.
+    c.regs.insert(0x42, 0x2A)
+    c.regs.insert(0x40, 0x08)
+    c.regs.insert(0x7C, 0x02)
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeLowPower))
+    test.assert_eq(at(c.regs, 0x42) & 0x0F, 8)
+    c.regs.insert(0x42, 0x23)
+    c.regs.insert(0x40, 0x00)
+    c.regs.insert(0x7C, 0x02)
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeLowPower))
+    test.assert_eq(at(c.regs, 0x42) & 0x0F, 6)
+    test.assert_eq(at(c.regs, 0x40) & 0x0F, 1)
+    c.regs.insert(0x40, 0xA3)
+    c.regs.insert(0x42, 0xA2)
+    c.regs.insert(0x7C, 0x02)
+    test.assert(bmi270.set_power_mode(l, PowerMode.ModeNormal))
+    test.assert_eq(at(c.regs, 0x42) & 0x0F, 6)
+
+@test
+fn test_a_power_mode_fails_when_a_write_is_refused() [io, hw]
+    let a = absent_link(new_chip(false))
+    test.assert(not bmi270.set_power_mode(a, PowerMode.ModeSuspend))
+    test.assert(not bmi270.set_power_mode(a, PowerMode.ModeConfiguration))
+    test.assert(not bmi270.set_power_mode(a, PowerMode.ModeLowPower))
+    test.assert(not bmi270.set_power_mode(a, PowerMode.ModeNormal))
+    for reg in [0x7C, 0x40, 0x42, 0x7D]
+        let c = new_chip(false)
+        c.mute.insert(reg, 1)
+        test.assert(not bmi270.set_power_mode(i2c_link(c), PowerMode.ModeNormal))
+        let d = new_chip(false)
+        d.mute.insert(reg, 1)
+        test.assert(not bmi270.set_power_mode(i2c_link(d), PowerMode.ModeLowPower))
+    let s = new_chip(false)
+    s.mute.insert(0x7D, 1)
+    test.assert(not bmi270.set_power_mode(i2c_link(s), PowerMode.ModeSuspend))
+    let k = new_chip(false)
+    k.mute.insert(0x7C, 1)
+    test.assert(not bmi270.set_power_mode(i2c_link(k), PowerMode.ModeSuspend))
+    let h = new_chip(false)
+    h.deaf.insert(0x40, 1)
+    test.assert(not bmi270.set_power_mode(i2c_link(h), PowerMode.ModeNormal))
+    let g = new_chip(false)
+    g.deaf.insert(0x42, 1)
+    test.assert(not bmi270.set_power_mode(i2c_link(g), PowerMode.ModeLowPower))
+
+// ── Ranges and rates ─────────────────────────────────────────────────
+
+@test
+fn test_ranges_and_rates_are_set_and_read_back() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert_eq(bmi270.acc_range_read(l) ?? -1, 2)
+    test.assert(bmi270.acc_range_write(l, AccelRange16g))
+    test.assert_eq(bmi270.acc_range_read(l) ?? -1, 3)
+    test.assert_eq(bmi270.gyr_range_read(l) ?? -1, 0)
+    test.assert(bmi270.gyr_range_write(l, GyroRange500dps))
+    test.assert_eq(bmi270.gyr_range_read(l) ?? -1, 2)
+    test.assert(bmi270.gyr_range_write_125(l))
+    test.assert_eq(bmi270.gyr_range_read(l) ?? -1, 4)
+    // The rates: the power-up 100 Hz and 200 Hz, then the slowest at or
+    // above a request in the filter mode the part is in (performance).
+    test.assert_eq(bmi270.acc_rate_mhz(l), 100000)
+    test.assert_eq(bmi270.gyr_rate_mhz(l), 200000)
+    test.assert_eq(bmi270.acc_rate_write(l, 300000), 400000)
+    test.assert_eq(bmi270.acc_rate_mhz(l), 400000)
+    test.assert_eq(at(c.regs, 0x40), 0xAA)
+    test.assert_eq(bmi270.gyr_rate_write(l, 1000), 25000)
+    test.assert_eq(at(c.regs, 0x42), 0xA6)
+    // A rate above the mode's fastest is the fastest.
+    test.assert_eq(bmi270.acc_rate_write(l, 9000000), 1600000)
+    test.assert_eq(bmi270.gyr_rate_write(l, 9000000), 3200000)
+    // A part that does not answer.
+    let a = absent_link(c)
+    test.assert(bmi270.acc_range_read(a) == None)
+    test.assert(bmi270.gyr_range_read(a) == None)
+    test.assert(not bmi270.acc_range_write(a, AccelRange2g))
+    test.assert(not bmi270.gyr_range_write(a, GyroRange250dps))
+    test.assert(not bmi270.gyr_range_write_125(a))
+    test.assert_eq(bmi270.acc_rate_mhz(a), -1)
+    test.assert_eq(bmi270.gyr_rate_mhz(a), -1)
+    test.assert_eq(bmi270.acc_rate_write(a, 1), -1)
+    test.assert_eq(bmi270.gyr_rate_write(a, 1), -1)
+    c.mute.insert(0x40, 1)
+    test.assert_eq(bmi270.acc_rate_write(l, 1), -1)
+    c.mute.insert(0x42, 1)
+    test.assert_eq(bmi270.gyr_rate_write(l, 1), -1)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_is_converted_at_the_range_it_was_taken() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    // 1 g on z at +-8 g is 4096; the gyroscope turns -16.384 dps/dps.
+    put16(c, 0x0C, 0)
+    put16(c, 0x0E, 0)
+    put16(c, 0x10, 4096)
+    put16(c, 0x12, 16384)
+    put16(c, 0x14, 0)
+    put16(c, 0x16, 0x8000)
+    match bmi270.accel_sample(l)
+        Some(a) =>
+            test.assert_eq(a.x, 0)
+            test.assert_eq(a.z, 1000)
+        None => test.assert(false)
+    match bmi270.gyro_sample(l)
+        Some(g) =>
+            test.assert_eq(g.x, 1000000)
+            test.assert_eq(g.z, -2000000)
+        None => test.assert(false)
+    // At +-2 g the same count is 0.25 g.
+    test.assert(bmi270.acc_range_write(l, AccelRange2g))
+    match bmi270.accel_sample(l)
+        Some(a) => test.assert_eq(a.z, 250)
+        None => test.assert(false)
+    c.deaf.insert(0x0C, 1)
+    test.assert(bmi270.accel_sample(l) == None)
+    c.deaf.insert(0x41, 1)
+    test.assert(bmi270.accel_sample(l) == None)
+    c.deaf.insert(0x12, 1)
+    test.assert(bmi270.gyro_sample(l) == None)
+    c.deaf.insert(0x43, 1)
+    test.assert(bmi270.gyro_sample(l) == None)
+
+@test
+fn test_the_paired_sample_is_one_read_of_twelve_bytes() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    put16(c, 0x0C, 100)
+    put16(c, 0x0E, 0xFF9C)
+    put16(c, 0x10, 4096)
+    put16(c, 0x12, 1)
+    put16(c, 0x14, 2)
+    put16(c, 0x16, 3)
+    test.assert(bmi270.acc_range_write(l, AccelRange4g))
+    test.assert(bmi270.gyr_range_write(l, GyroRange250dps))
+    match bmi270.imu_sample(l)
+        Some(s) =>
+            // 8192 LSB/g at +-4 g.
+            test.assert_eq(s.accel.x, 12)
+            test.assert_eq(s.accel.y, -12)
+            test.assert_eq(s.accel.z, 500)
+            // 131.072 LSB/dps at +-250 dps: 1 count is 7 mdps.
+            test.assert_eq(s.gyro.x, 7)
+            test.assert_eq(s.gyro.y, 15)
+            test.assert_eq(s.gyro.z, 22)
+        None => test.assert(false)
+    c.deaf.insert(0x0C, 1)
+    test.assert(bmi270.imu_sample(l) == None)
+    c.deaf.insert(0x41, 1)
+    test.assert(bmi270.imu_sample(l) == None)
+
+@test
+fn test_data_ready_temperature_and_errors() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert(not bmi270.accel_ready(l))
+    test.assert(not bmi270.gyro_ready(l))
+    c.regs.insert(0x03, 0xD0)
+    test.assert(bmi270.accel_ready(l))
+    test.assert(bmi270.gyro_ready(l))
+    c.regs.insert(0x03, 0x90)
+    test.assert(bmi270.accel_ready(l))
+    test.assert(not bmi270.gyro_ready(l))
+    test.assert_eq(bmi270.status_read(l) ?? -1, 0x90)
+    c.deaf.insert(0x03, 1)
+    test.assert(not bmi270.accel_ready(l))
+    test.assert(not bmi270.gyro_ready(l))
+    // The temperature is invalid until the first measurement.
+    test.assert(bmi270.temperature(l) == None)
+    put16(c, 0x22, 0x0200)
+    test.assert_eq(bmi270.temperature(l) ?? -1, 24000)
+    c.deaf.insert(0x22, 1)
+    test.assert(bmi270.temperature(l) == None)
+    c.regs.insert(0x02, 0x01)
+    test.assert_eq(bmi270.error_status(l) ?? -1, 1)
+    test.assert(bmi270.error_status(absent_link(c)) == None)
+
+// ── Interrupt pins ───────────────────────────────────────────────────
+
+@test
+fn test_the_interrupt_pins_and_the_data_ready_map() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert(bmi270.int_pin_config(l, 1, true, false))
+    test.assert_eq(at(c.regs, 0x53), 0x0A)
+    test.assert(bmi270.int_pin_config(l, 2, false, true))
+    test.assert_eq(at(c.regs, 0x54), 0x0C)
+    test.assert(not bmi270.int_pin_config(l, 3, true, true))
+    test.assert(bmi270.int_map_data_ready(l, 1, true))
+    test.assert_eq(at(c.regs, 0x58), 0x04)
+    test.assert(bmi270.int_map_data_ready(l, 2, true))
+    test.assert_eq(at(c.regs, 0x58), 0x44)
+    test.assert(bmi270.int_map_data_ready(l, 1, false))
+    test.assert_eq(at(c.regs, 0x58), 0x40)
+    test.assert(bmi270.int_map_data_ready(l, 2, false))
+    test.assert_eq(at(c.regs, 0x58), 0x00)
+    test.assert(not bmi270.int_map_data_ready(l, 0, true))
+    test.assert(bmi270.int_latch(l, true))
+    test.assert_eq(at(c.regs, 0x55), 1)
+    test.assert(bmi270.int_latch(l, false))
+    test.assert_eq(at(c.regs, 0x55), 0)
+    c.regs.insert(0x1D, 0xC0)
+    test.assert_eq(bmi270.int_status(l) ?? -1, 0xC0)
+    test.assert(not bmi270.int_latch(absent_link(c), true))
+    test.assert(not bmi270.int_map_data_ready(absent_link(c), 1, true))
+
+@test
+fn test_the_interrupt_line_level() [io, hw]
+    let c = new_chip(false)
+    let p = FakePins { c: c }
+    let w = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x68), 7)
+    c.st.insert(107, 1)
+    test.assert_eq(bmi270.irq_level_of(p, w), 1)
+    test.assert_eq(bmi270.irq_level_of(p, dev_bus.wiring_i2c(0, 0x68)), -1)
+    // The pin's get on the double, with the pin low.
+    c.st.insert(107, 0)
+    test.assert_eq(bmi270.irq_level_of(p, w), 0)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+fn fill_fifo(c: Chip, frames: Int, size: Int)
+    // Frame f: every byte is f for the gyroscope half, then the
+    // accelerometer's x, y, z counts of 4096 + f, 8192 + f and 0 at +-8 g.
+    var n = 0
+    for f in 0..frames
+        if size == 12
+            for k in 0..6
+                c.fifo.insert(n, 0xEE)
+                n = n + 1
+        let x = 4096 + f
+        let y = 8192 + f
+        let z = 0
+        c.fifo.insert(n, x & 0xFF)
+        c.fifo.insert(n + 1, x >> 8)
+        c.fifo.insert(n + 2, y & 0xFF)
+        c.fifo.insert(n + 3, y >> 8)
+        c.fifo.insert(n + 4, z & 0xFF)
+        c.fifo.insert(n + 5, z >> 8)
+        n = n + 6
+    c.st.insert(K_FLEN, n)
+    c.st.insert(K_HEAD, 0)
+
+@test
+fn test_the_fifo_is_read_in_whole_frames() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert(bmi270.fifo_enable(l, true, false))
+    test.assert_eq(at(c.regs, 0x49), 0x40)
+    test.assert_eq(bmi270.fifo_frame_size(l), 6)
+    fill_fifo(c, 40, 6)
+    test.assert_eq(bmi270.fifo_bytes(l) ?? -1, 240)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 32)
+    test.assert_eq(out.len(), 32)
+    // +-8 g is 4096 LSB/g: frame 0 is (1000, 2000, 0), frame 31 is 7 mg up.
+    test.assert_eq(out[0].x, 1000)
+    test.assert_eq(out[0].y, 2000)
+    test.assert_eq(out[0].z, 0)
+    test.assert_eq(out[31].x, 1007)
+    test.assert_eq(out[31].y, 2007)
+    // Eight frames are left, and then none.
+    test.assert_eq(bmi270.fifo_bytes(l) ?? -1, 48)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 8)
+    test.assert_eq(out[0].x, 1007)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_a_frame_with_both_sensors_gives_its_accelerometer_half() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert(bmi270.fifo_enable(l, true, true))
+    test.assert_eq(at(c.regs, 0x49), 0xC0)
+    test.assert_eq(bmi270.fifo_frame_size(l), 12)
+    fill_fifo(c, 7, 12)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 7)
+    test.assert_eq(out[0].x, 1000)
+    test.assert_eq(out[6].x, 1001)
+    test.assert_eq(out[6].y, 2001)
+
+@test
+fn test_a_fifo_the_driver_does_not_read_gives_nothing() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    // Header mode (the power-up value 0x10) is not parsed.
+    test.assert_eq(bmi270.fifo_frame_size(l), 0)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+    // The gyroscope alone has no accelerometer frames.
+    test.assert(bmi270.fifo_enable(l, false, true))
+    test.assert_eq(bmi270.fifo_frame_size(l), 6)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+    // No sensor at all.
+    test.assert(bmi270.fifo_enable(l, false, false))
+    test.assert_eq(bmi270.fifo_frame_size(l), 0)
+    // The part gone.
+    let a = absent_link(c)
+    test.assert_eq(bmi270.fifo_frame_size(a), 0)
+    test.assert_eq(bmi270.fifo_read_accel(a, var out), 0)
+    test.assert(bmi270.fifo_bytes(a) == None)
+    test.assert(not bmi270.fifo_enable(a, true, true))
+
+@test
+fn test_the_fifo_read_stops_at_the_first_failure() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert(bmi270.fifo_enable(l, true, false))
+    fill_fifo(c, 10, 6)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    c.deaf.insert(0x26, 1)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+    c.deaf.clear()
+    c.deaf.insert(0x41, 1)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+    c.deaf.clear()
+    c.deaf.insert(0x24, 1)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+    c.deaf.clear()
+    c.deaf.insert(0x49, 1)
+    test.assert_eq(bmi270.fifo_read_accel(l, var out), 0)
+
+// ── Self-tests ───────────────────────────────────────────────────────
+
+@test
+fn test_the_accelerometer_self_test_passes_on_the_data_sheets_limits() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    c.st.insert(K_ST_SCALE, 3)
+    // The excitation is 18 g, -16 g and 12 g between the two signs: past
+    // 16 g, below -15 g and past 10 g.
+    test.assert_eq(bmi270.accel_self_test(l), 0)
+    // The part was left at +-16 g, 1600 Hz, self-test off.
+    test.assert_eq(at(c.regs, 0x41), 3)
+    test.assert_eq(at(c.regs, 0x40), 0xAC)
+    test.assert_eq(at(c.regs, 0x6D), 0x00)
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+
+@test
+fn test_the_accelerometer_self_test_names_the_failing_axes() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    // A quarter of the excitation fails every axis.
+    c.st.insert(K_ST_SCALE, 0)
+    test.assert_eq(bmi270.accel_self_test(l), 7)
+    // 15.5 g on x passes at none of the axes' limits but x is under 16 g;
+    // y -14 g and z 10.5 g: a scale of 2 gives 0.75 of each.
+    let d = new_chip(false)
+    d.st.insert(K_ST_SCALE, 2)
+    // 13.5 g on x fails, -12 g on y fails, 9 g on z fails.
+    test.assert_eq(bmi270.accel_self_test(i2c_link(d)), 7)
+    // A scale of 3 with y's limit reached from the other side: pass.
+    let e = new_chip(false)
+    e.st.insert(K_ST_SCALE, 3)
+    test.assert_eq(bmi270.accel_self_test(i2c_link(e)), 0)
+
+@test
+fn test_the_accelerometer_self_test_stops_when_the_part_stops() [io, hw]
+    test.assert_eq(bmi270.accel_self_test(absent_link(new_chip(false))), -1)
+    for reg in [0x7D, 0x41, 0x40, 0x6D]
+        let c = new_chip(false)
+        c.mute.insert(reg, 1)
+        c.st.insert(K_ST_SCALE, 3)
+        test.assert_eq(bmi270.accel_self_test(i2c_link(c)), -1)
+    let d = new_chip(false)
+    d.deaf.insert(0x0C, 1)
+    test.assert_eq(bmi270.accel_self_test(i2c_link(d)), -1)
+
+@test
+fn test_the_gyroscope_self_test_reads_the_axes_and_the_status() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    // done, and all three axes ok.
+    c.st.insert(K_ST_AXES, 0x0F)
+    c.st.insert(K_ST_STATUS, 0)
+    test.assert_eq(bmi270.gyro_self_test(l), 0)
+    // The block and select bits of G_TRIG_1 on page 1 were written 0 and
+    // the page was put back to 0.
+    test.assert_eq(at(c.page1, 0x32), 0)
+    test.assert_eq(at(c.page1, 0x33), 0)
+    test.assert_eq(at(c.st, K_PAGE), 0)
+    test.assert_eq(at(c.st, K_VIOLATIONS), 0)
+    // The z axis not ok.
+    let d = new_chip(false)
+    d.st.insert(K_ST_AXES, 0x07)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(d)), 4)
+    let e = new_chip(false)
+    e.st.insert(K_ST_AXES, 0x01)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(e)), 7)
+    let f = new_chip(false)
+    f.st.insert(K_ST_AXES, 0x0D)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(f)), 1)
+    let g = new_chip(false)
+    g.st.insert(K_ST_AXES, 0x0B)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(g)), 2)
+    // The status of the command: 1 is a precondition not met.
+    let h = new_chip(false)
+    h.st.insert(K_ST_AXES, 0x0F)
+    h.st.insert(K_ST_STATUS, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(h)), -3)
+
+@test
+fn test_the_gyroscope_self_test_times_out_and_stops_when_the_part_stops() [io, hw]
+    // The command is ignored: the done bit never rises.
+    let c = new_chip(false)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(c)), -2)
+    // Two seconds of 10 ms polls at least.
+    test.assert(at(c.st, K_CLOCK) > 2000000)
+    test.assert_eq(bmi270.gyro_self_test(absent_link(new_chip(false))), -1)
+    for reg in [0x7D, 0x2F, 0x32, 0x7E]
+        let d = new_chip(false)
+        d.mute.insert(reg, 1)
+        d.st.insert(K_ST_AXES, 0x0F)
+        let r = bmi270.gyro_self_test(i2c_link(d))
+        test.assert(r == -1 or r == -2)
+    let e = new_chip(false)
+    e.st.insert(K_ST_AXES, 0x0F)
+    e.deaf.insert(0x6E, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(e)), -1)
+    let f = new_chip(false)
+    f.st.insert(K_ST_AXES, 0x0F)
+    f.deaf.insert(0x38, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(f)), -1)
+
+// ── The wire ─────────────────────────────────────────────────────────
+
+@test
+fn test_an_spi_read_has_bit_7_set_and_drops_the_dummy_byte() [io, hw]
+    let c = new_chip(true)
+    let l = spi_link(c)
+    // The first read is invalid and wakes the interface.
+    var junk: DevBytes = Vec.new()
+    test.assert(l.link_read(0x00, 1, var junk))
+    test.assert_eq(junk[0] as Int, 0xFF)
+    // Then a read is the dummy byte and the register: CHIP_ID reads 0x24.
+    var b: DevBytes = Vec.new()
+    test.assert(l.link_read(0x00, 1, var b))
+    test.assert_eq(b.len(), 1)
+    test.assert_eq(b[0] as Int, 0x24)
+    // A longer read keeps the order: the registers 0x0C to 0x0F.
+    put16(c, 0x0C, 0x1234)
+    put16(c, 0x0E, 0x5678)
+    test.assert(l.link_read(0x0C, 4, var b))
+    test.assert_eq(b.len(), 4)
+    test.assert_eq(b[0] as Int, 0x34)
+    test.assert_eq(b[3] as Int, 0x56)
+
+@test
+fn test_an_spi_write_has_bit_7_clear() [io, hw]
+    let c = new_chip(true)
+    let l = spi_link(c)
+    bmi270.spi_wake(l.bus, l.pins, l.w)
+    var one: DevBytes = Vec.new()
+    let _ = one.push(0x03 as u8)
+    // The address byte is the register with bit 7 clear whatever was asked.
+    test.assert(l.link_write(0x80 | 0x41, one))
+    test.assert_eq(at(c.regs, 0x41), 3)
+    // 31 bytes is the most a frame holds, 32 is refused.
+    var many: DevBytes = Vec.new()
+    for i in 0..31
+        let _ = many.push(i as u8)
+    test.assert(l.link_write(0x2E, many))
+    let _ = many.push(0 as u8)
+    test.assert(not l.link_write(0x2E, many))
+
+@test
+fn test_the_part_ignores_spi_writes_before_the_first_read() [io, hw]
+    let c = new_chip(true)
+    let l = spi_link(c)
+    var one: DevBytes = Vec.new()
+    let _ = one.push(0x03 as u8)
+    test.assert(l.link_write(0x41, one))
+    test.assert_eq(at(c.regs, 0x41), 0x02)
+    l.link_wake()
+    test.assert(l.link_write(0x41, one))
+    test.assert_eq(at(c.regs, 0x41), 0x03)
+
+@test
+fn test_the_i2c_wiring_and_a_missing_address() [io, hw]
+    let c = new_chip(false)
+    var b: DevBytes = Vec.new()
+    // A wiring on SPI is refused by the I2C functions and conversely.
+    test.assert(not bmi270.i2c_read(FakeI2c { c: c, addr: 0x68 }, dev_bus.wiring_spi(0, 9), 0x00, 1, var b))
+    var one: DevBytes = Vec.new()
+    let _ = one.push(0x03 as u8)
+    test.assert(not bmi270.i2c_write(FakeI2c { c: c, addr: 0x68 }, dev_bus.wiring_spi(0, 9), 0x41, one))
+    test.assert(not bmi270.spi_read(FakeSpi { c: c }, FakePins { c: c }, dev_bus.wiring_i2c(0, 0x68), 0x00, 1, var b))
+    test.assert(not bmi270.spi_write(FakeSpi { c: c }, FakePins { c: c }, dev_bus.wiring_i2c(0, 0x68), 0x41, one))
+
+// ── The part on a board ──────────────────────────────────────────────
+
+@test
+fn test_the_types_answer_as_for_a_part_that_does_not_acknowledge() [io, hw]
+    let w = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x68), 7)
+    let a = Bmi270.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not a.begin())
+    test.assert(a.begin_code() != 0)
+    test.assert(a.accel_read() == None)
+    test.assert(not a.accel_ready())
+    test.assert(not a.accel_set_range(AccelRange4g))
+    let _ = a.accel_range()
+    test.assert_eq(a.accel_rate_hz(), 0)
+    test.assert_eq(a.accel_set_rate_hz(50), 0)
+    test.assert_eq(a.accel_fifo_count(), 0)
+    var fifo: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(a.accel_fifo_read(var fifo), 0)
+    test.assert(a.gyro_read() == None)
+    test.assert(not a.gyro_ready())
+    test.assert(not a.gyro_set_range(GyroRange500dps))
+    let _ = a.gyro_range()
+    test.assert_eq(a.gyro_rate_hz(), 0)
+    test.assert(a.imu_read() == None)
+    test.assert_eq(a.temp_start(), 0)
+    test.assert(a.temp_read() == None)
+    test.assert(a.device_id() == None)
+    test.assert(not a.set_power_mode(PowerMode.ModeSuspend))
+    test.assert(not a.fifo_enable(true, true))
+    test.assert(not a.map_data_ready(1))
+    test.assert_eq(a.accel_self_test(), -1)
+    test.assert_eq(a.gyro_self_test(), -1)
+    let _ = a.irq_level()
+    let _ = a.as_link()
+
+@test
+fn test_the_spi_type_over_an_absent_bus_finds_no_part() [io, hw]
+    // Absent SPI hardware reads every byte as 0, so CHIP_ID is not
+    // 0x24 and the part is not found; the other reads return zeros.
+    let w = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 9), 7)
+    let a = Bmi270Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not a.begin())
+    test.assert_eq(a.begin_code(), -1)
+    test.assert(a.device_id() == None)
+    test.assert(not a.accel_ready())
+    test.assert(not a.gyro_ready())
+    let _ = a.accel_read()
+    let _ = a.accel_range()
+    let _ = a.accel_set_range(AccelRange4g)
+    let _ = a.accel_rate_hz()
+    let _ = a.accel_set_rate_hz(50)
+    let _ = a.accel_fifo_count()
+    var fifo: Vec[AccelMilliG; 32] = Vec.new()
+    let _ = a.accel_fifo_read(var fifo)
+    let _ = a.gyro_read()
+    let _ = a.gyro_set_range(GyroRange500dps)
+    let _ = a.gyro_range()
+    let _ = a.gyro_rate_hz()
+    let _ = a.imu_read()
+    test.assert_eq(a.temp_start(), 0)
+    let _ = a.temp_read()
+    let _ = a.set_power_mode(PowerMode.ModeSuspend)
+    let _ = a.fifo_enable(true, true)
+    let _ = a.map_data_ready(2)
+    let _ = a.accel_self_test()
+    let _ = a.gyro_self_test()
+    let _ = a.irq_level()
+    let _ = a.as_link()
+
+@test
+fn test_the_board_link_chooses_its_chunk_by_bus() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x68)
+    let i = Bmi270.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert_eq(i.as_link().link_chunk(), 32)
+    // An absent I2C bus refuses the first write of the file.
+    test.assert(not bmi270.upload_config(i.as_link()))
+    test.assert_eq(bmi270.verify_config(i.as_link()), -1)
+    let s = Bmi270Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_spi(0, 9))
+    test.assert_eq(s.as_link().link_chunk(), 30)
+    // Absent SPI takes every write, and reads zeros back.
+    test.assert(bmi270.upload_config(s.as_link()))
+    test.assert(bmi270.verify_config(s.as_link()) > 0)
+    s.as_link().link_wake()
+    i.as_link().link_wake()
+    s.as_link().link_wait(1)
+
+@test
+fn test_the_fifo_count_and_the_temperature_reading() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert_eq(bmi270.fifo_frame_count(l), 0)
+    test.assert(bmi270.fifo_enable(l, true, true))
+    fill_fifo(c, 9, 12)
+    test.assert_eq(bmi270.fifo_frame_count(l), 9)
+    put16(c, 0x22, 0x0200)
+    match bmi270.temperature_reading(l)
+        Some(t) => test.assert_eq(t.milli_c, 24000)
+        None => test.assert(false)
+    c.deaf.insert(0x22, 1)
+    test.assert(bmi270.temperature_reading(l) == None)
+
+@test
+fn test_each_step_of_the_start_and_the_self_tests_can_fail_alone() [io, hw]
+    // INIT_CTRL written 1 refused, with the 0 accepted.
+    let a = new_chip(false)
+    a.mute.insert(0x10000 + 0x59 * 256 + 1, 1)
+    test.assert_eq(bmi270.start(i2c_link(a)), -2)
+    // The accelerometer's self-test: each of its later writes and its
+    // second read.
+    for v in [0x0D, 0x09, 0x00]
+        let c = new_chip(false)
+        c.st.insert(K_ST_SCALE, 3)
+        c.mute.insert(0x10000 + 0x6D * 256 + v, 1)
+        test.assert_eq(bmi270.accel_self_test(i2c_link(c)), -1)
+    let d = new_chip(false)
+    d.st.insert(K_ST_SCALE, 3)
+    d.deaf.insert(0x0C, 2)
+    test.assert_eq(bmi270.accel_self_test(i2c_link(d)), -1)
+    // The gyroscope's: G_TRIG_1, the page back to 0, the command.
+    let e = new_chip(false)
+    e.st.insert(K_ST_AXES, 0x0F)
+    e.mute.insert(0x32, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(e)), -1)
+    let f = new_chip(false)
+    f.st.insert(K_ST_AXES, 0x0F)
+    f.mute.insert(0x10000 + 0x2F * 256 + 0, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(f)), -1)
+    let g = new_chip(false)
+    g.st.insert(K_ST_AXES, 0x0F)
+    g.mute.insert(0x7E, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(g)), -1)
+    let h = new_chip(false)
+    h.st.insert(K_ST_AXES, 0x0F)
+    h.mute.insert(0x2F, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(h)), -1)
+    let i = new_chip(false)
+    i.st.insert(K_ST_AXES, 0x0F)
+    i.mute.insert(0x7D, 1)
+    test.assert_eq(bmi270.gyro_self_test(i2c_link(i)), -1)
+    // The power-mode rates held to the top of normal mode.
+    let j = new_chip(false)
+    j.regs.insert(0x40, 0xAE)
+    j.regs.insert(0x42, 0xAF)
+    test.assert(bmi270.set_power_mode(i2c_link(j), PowerMode.ModeNormal))
+    test.assert_eq(at(j.regs, 0x40) & 0x0F, 12)
+    test.assert_eq(at(j.regs, 0x42) & 0x0F, 13)
+
+@test
+fn test_a_register_is_read_alone() [io, hw]
+    let c = new_chip(false)
+    let l = i2c_link(c)
+    test.assert_eq(bmi270.reg_get(l, 0x00) ?? -1, 0x24)
+    test.assert_eq(bmi270.reg_get(l, 0x7C) ?? -1, 0x03)
+    test.assert(bmi270.reg_get(absent_link(c), 0x00) == None)

@@ -1,0 +1,1246 @@
+// bmi270: Bosch Sensortec's BMI270 six-axis inertial measurement unit, on
+// an I2C or an SPI bus.
+//
+// The part holds a 16-bit three-axis accelerometer, a 16-bit three-axis
+// gyroscope and a temperature sensor.  It has no firmware of its own in
+// non-volatile memory: after every power-up and every soft reset the host
+// writes it an 8192-byte configuration file, and only then do the sensors
+// work.  The facts below are from Bosch Sensortec's data sheet "BMI270:
+// 6-axis, smart, low power Inertial Measurement Unit for high-performance
+// applications", document BST-BMI270-DS000-08, revision 1.6, March 2026.
+// The register map in it corresponds to BMI270_main.tbin version 4.8,
+// register map version 4.4.  The configuration file is in the module
+// `bmi270_config`.
+//
+// A board's device table binds the part to this driver, by the I2C address
+// 0x68 (SDO low) or 0x69 (SDO high), or by the chip-select pin on SPI:
+//
+//     devices
+//         imu  Bmi270     from "bmi270-nv"  on i2c0  addr 0x68  irq imu_int1
+//         imu  Bmi270Spi  from "bmi270-nv"  on spi0  cs imu_cs  irq imu_int1
+//
+// The two types differ in their bus handle only.
+//
+// What the driver does, in the order a program meets it:
+//
+//   1. Interface selection (section 6.3).  After power-up the part is on
+//      I2C.  A rising edge of CSB switches it to SPI until the next reset,
+//      so on SPI the first thing the driver does is read CHIP_ID once and
+//      discard the answer.  The part needs the same read after a soft reset.
+//   2. Initialisation (section 4.4).  CHIP_ID must read 0x24.  A soft
+//      reset (CMD 0xB6) follows, then advanced power save is turned off
+//      (PWR_CONF.adv_power_save = 0, 450 us wait), INIT_CTRL is written 0,
+//      the 8192-byte file is written to INIT_DATA, INIT_CTRL is written
+//      1, and INTERNAL_STATUS.message is polled until it reads 1, which
+//      takes at most 20 ms.  The file goes in bursts: the host's longest
+//      burst is 32 bytes on I2C and 30 on SPI, and the data sheet's
+//      footnote says that between two writes INIT_ADDR_0 and INIT_ADDR_1
+//      are set to the byte index divided by two.
+//   3. Power modes (section 4.5, Table 6).  PWR_CTRL enables the
+//      accelerometer, the gyroscope and the temperature sensor.  PWR_CONF
+//      selects advanced power save (low power and suspend modes), under
+//      which a register write needs 450 us before the next one.
+//
+// Drivers read for their fixes, nothing ported: Bosch Sensortec's BMI270
+// Sensor API (`bmi2.c`, `bmi270.c`, v2.86.1) and Zephyr's
+// `drivers/sensor/bosch/bmi270/bmi270.c`.  Each fix kept is named at its
+// site.
+
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
+use dev_imu.{ ImuSample, Imu }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use bmi270_config.{ BMI270_CONFIG, CONFIG_LEN }
+
+// The registers (section 5.2).
+let REG_CHIP_ID     = 0x00
+let REG_ERR         = 0x02
+let REG_STATUS      = 0x03
+let REG_DATA_ACC    = 0x0C
+let REG_DATA_GYR    = 0x12
+let REG_INT_STATUS1 = 0x1D
+let REG_INTERNAL    = 0x21
+let REG_TEMPERATURE = 0x22
+let REG_FIFO_LENGTH = 0x24
+let REG_FIFO_DATA   = 0x26
+let REG_FEAT_PAGE   = 0x2F
+let REG_FEATURES    = 0x30
+let REG_ACC_CONF    = 0x40
+let REG_ACC_RANGE   = 0x41
+let REG_GYR_CONF    = 0x42
+let REG_GYR_RANGE   = 0x43
+let REG_FIFO_CFG0   = 0x48
+let REG_FIFO_CFG1   = 0x49
+let REG_INT1_IO     = 0x53
+let REG_INT2_IO     = 0x54
+let REG_INT_LATCH   = 0x55
+let REG_INT_MAP     = 0x58
+let REG_INIT_CTRL   = 0x59
+let REG_INIT_ADDR   = 0x5B
+let REG_INIT_DATA   = 0x5E
+let REG_ACC_ST      = 0x6D
+let REG_GYR_ST      = 0x6E
+let REG_PWR_CONF    = 0x7C
+let REG_PWR_CTRL    = 0x7D
+let REG_CMD         = 0x7E
+
+// The value CHIP_ID reads (section 5.2.1).
+let CHIP_ID = 0x24
+
+// CMD (section 5.2.86).
+let CMD_G_TRIGGER = 0x02
+let CMD_FIFO_FLUSH = 0xB0
+let CMD_SOFT_RESET = 0xB6
+
+// PWR_CONF: advanced power save off with the FIFO wake-up on, the
+// reset value 0x03 with bit 0 cleared; and on.
+let PWR_CONF_APS_OFF = 0x02
+let PWR_CONF_APS_ON  = 0x03
+
+// PWR_CTRL: the temperature sensor, the accelerometer and the gyroscope.
+let PWR_CTRL_ALL = 0x0E
+let PWR_CTRL_ACC = 0x04
+let PWR_CTRL_NONE = 0x00
+
+// Waits in microseconds.  The first two are the data sheet's: 450 us
+// after a register write in advanced power save mode (Table 19, section
+// 4.5) and 2 us otherwise (Table 19), and the soft reset's 2 ms from the
+// Sensor API.  The start-ups are Tables 2 and 3: 2 ms for the
+// accelerometer and 45 ms for the gyroscope from suspend.
+let WRITE_GAP_US    = 450
+let NORMAL_GAP_US   = 2
+let SOFT_RESET_US   = 2000
+let GYRO_START_US   = 45000
+let INIT_POLL_US    = 1000
+
+// The results of `start`.
+let START_OK       = 0
+let START_NO_PART  = -1
+let START_BUS      = -2
+let START_REFUSED  = -3
+
+// The power modes of Table 6.
+pub @value
+enum PowerMode
+    ModeSuspend
+    ModeConfiguration
+    ModeLowPower
+    ModeNormal
+    ModePerformance
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+// The acceleration in milli-g that a 16-bit count means at the range
+// code `acc_range` (ACC_RANGE, 0 to 3 for +-2, 4, 8 and 16 g).  The
+// sensitivities are 16384, 8192, 4096 and 2048 LSB/g (Table 2), which is
+// the full scale over 2^15.
+//
+// ```novo
+// use bmi270
+//
+// fn main() [io]
+//     // 16384 LSB/g at +-2 g: a count of 16384 is 1 g.
+//     println("${bmi270.accel_mg(16384, 0)}")    // 1000
+//     // 2048 LSB/g at +-16 g.
+//     println("${bmi270.accel_mg(2048, 3)}")     // 1000
+//     println("${bmi270.accel_mg(65535, 0)}")    // 0
+// ```
+pub fn accel_mg(raw: Int, acc_range: Int) -> Int
+    let scale = accel_full_scale_mg(acc_range)
+    dev_bus.dev_sign_extend(raw, 16) * scale / 32768
+
+// The full scale of ACC_RANGE in milli-g.
+pub fn accel_full_scale_mg(acc_range: Int) -> Int
+    match acc_range & 3
+        0 => 2000
+        1 => 4000
+        2 => 8000
+        _ => 16000
+
+// The full scale of GYR_RANGE in milli-degrees per second: 0 is 2000
+// dps, 1 is 1000, 2 is 500, 3 is 250 and 4 is 125 (section 5.2.44).  The
+// codes 5 to 7 are reserved and read as 125.
+pub fn gyro_full_scale_mdps(gyr_range: Int) -> Int
+    match gyr_range & 7
+        0 => 2000000
+        1 => 1000000
+        2 => 500000
+        3 => 250000
+        _ => 125000
+
+// The rate in milli-degrees per second that a 16-bit count means at the
+// range code `gyr_range` (GYR_RANGE).  The sensitivities are 16.384,
+// 32.768, 65.536, 131.072 and 262.144 LSB/dps (Table 3), the full scale
+// over 2^15.  Fix kept: the register description of GYR_RANGE gives the
+// rounded 16.4, 32.8, 65.6, 131.2 and 262.4; Table 3 gives the exact
+// values, which are used here, so a count of 16384 at 2000 dps is
+// exactly 1000 dps and not 999.0.
+//
+// ```novo
+// use bmi270
+//
+// fn main() [io]
+//     println("${bmi270.gyro_mdps(16384, 0)}")   // 1000000
+//     println("${bmi270.gyro_mdps(-16384, 3)}")  // -125000
+// ```
+pub fn gyro_mdps(raw: Int, gyr_range: Int) -> Int
+    dev_bus.dev_sign_extend(raw, 16) * gyro_full_scale_mdps(gyr_range) / 32768
+
+// The temperature in thousandths of a degree Celsius that a TEMPERATURE
+// word means, or `None` for the invalid word 0x8000 (section 4.6.14).
+// The word is signed, 512 LSB per kelvin, and 0x0000 is 23 degrees; 0x7FFF
+// is 87 - 1/512 and 0x8001 is -(41 - 1/512).
+//
+// ```novo
+// use bmi270
+//
+// fn main() [io]
+//     println("${bmi270.temp_milli_c(0x0000) ?? -1}")   // 23000
+//     println("${bmi270.temp_milli_c(0x7FFF) ?? -1}")   // 86998
+//     println("${bmi270.temp_milli_c(0x8001) ?? -1}")   // -40998
+// ```
+pub fn temp_milli_c(word: Int) -> ?Int
+    let w = word & 0xFFFF
+    if w == 0x8000
+        return None
+    Some(23000 + dev_bus.dev_sign_extend(w, 16) * 1000 / 512)
+
+// The output data rate of an ACC_CONF code in thousandths of a hertz, or
+// -1 for a reserved code (section 5.2.41): 1 is 25/32 Hz, 2 is 25/16, 3
+// is 25/8, 4 is 25/4, 5 is 12.5 Hz, and 6 to 12 are 25 Hz doubling up to
+// 1600 Hz.  The codes 0 and 13 to 15 are reserved.
+pub fn acc_odr_mhz(code: Int) -> Int
+    match code & 15
+        1 => 781
+        2 => 1562
+        3 => 3125
+        4 => 6250
+        5 => 12500
+        6 => 25000
+        7 => 50000
+        8 => 100000
+        9 => 200000
+        10 => 400000
+        11 => 800000
+        12 => 1600000
+        _ => -1
+
+// The output data rate of a GYR_CONF code in thousandths of a hertz, or
+// -1 for a reserved code (section 5.2.43): 6 is 25 Hz, up to 13 for
+// 3200 Hz.
+pub fn gyr_odr_mhz(code: Int) -> Int
+    if (code & 15) < 6 or (code & 15) > 13
+        return -1
+    25000 << ((code & 15) - 6)
+
+// The ACC_CONF code of the slowest rate at or above `mhz` that the
+// filter mode allows, or the fastest the mode has.  With `perf` set
+// (the performance filter, aliasing-free) the rates are 12.5 Hz to
+// 1600 Hz, codes 5 to 12; with it clear (low power) they are 25/32 Hz to
+// 400 Hz, codes 1 to 10 (section 4.6).
+pub fn acc_code_for(mhz: Int, perf: Bool) -> Int
+    var lo = 1
+    var hi = 10
+    if perf
+        lo = 5
+        hi = 12
+    for c in lo..hi
+        if acc_odr_mhz(c) >= mhz
+            return c
+    hi
+
+// The GYR_CONF code of the slowest rate at or above `mhz` that the
+// filter mode allows, or the fastest the mode has.  With `perf` set the
+// rates are 25 Hz to 3200 Hz, codes 6 to 13; with it clear they are 25,
+// 50 and 100 Hz, codes 6 to 8 (section 4.6.12).
+pub fn gyr_code_for(mhz: Int, perf: Bool) -> Int
+    var hi = 8
+    if perf
+        hi = 13
+    for c in 6..hi
+        if gyr_odr_mhz(c) >= mhz
+            return c
+    hi
+
+// The code of `r` for ACC_RANGE.
+pub fn acc_range_code(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 0
+        AccelRange4g  => 1
+        AccelRange8g  => 2
+        AccelRange16g => 3
+
+// The range of a code.
+pub fn acc_range_of(code: Int) -> AccelRange
+    match code & 3
+        0 => AccelRange2g
+        1 => AccelRange4g
+        2 => AccelRange8g
+        _ => AccelRange16g
+
+// The code of `r` for GYR_RANGE.
+pub fn gyr_range_code(r: GyroRange) -> Int
+    match r
+        GyroRange250dps  => 3
+        GyroRange500dps  => 2
+        GyroRange1000dps => 1
+        GyroRange2000dps => 0
+
+// The range of a code.  The part also has +-125 dps, code 4, which
+// `GyroRange` has no value for.  The narrowest range of the trait that
+// holds it is +-250 dps, which is what 4 and the reserved codes 5 to 7
+// answer; the readings are still converted at 125 dps.
+pub fn gyr_range_of(code: Int) -> GyroRange
+    match code & 7
+        0 => GyroRange2000dps
+        1 => GyroRange1000dps
+        2 => GyroRange500dps
+        _ => GyroRange250dps
+
+// ── The link: how register bytes reach the part ──────────────────────
+
+// What the driver needs of the wire: read `n` register bytes into `dst`,
+// write them, wait, and bring the interface up.  A register read is
+// `n` bytes at the register `reg` (the address advances, except at
+// FIFO_DATA and INIT_DATA, which trap it).  Two links exist, over I2C
+// and over SPI, and a test may write a third over a double.
+pub trait BmiLink
+    // Reads `n` bytes from `reg` into `dst`; answers whether the part
+    // answered.  `dst` is emptied first.  At most 31 bytes.
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    // Writes the bytes of `src` from `reg`; answers whether the part
+    // took them.
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+    // Waits `us` microseconds.
+    fn link_wait(self, us: Int) [hw]
+    // On SPI, reads CHIP_ID once and discards it (section 6.3); on I2C
+    // does nothing.
+    fn link_wake(self) [hw]
+    // The longest burst the link writes, in bytes and even: 32 on I2C
+    // and 30 on SPI, whose frame also holds the register byte.
+    fn link_chunk(self) -> Int [hw]
+
+// A register read over I2C: the register address, a repeated start and
+// the bytes.  The part has no dummy byte on I2C.
+pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// A register write over I2C: the register address and the bytes in one
+// transaction.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// A register read over SPI: the address with bit 7 set, then one dummy
+// byte, then the register bytes.  Fix kept: "for a multiple read
+// operation of n bytes, n+1 bytes have to be read, the first has to be
+// dropped" (section 6.4); Bosch's API reads `len + dummy_byte` and
+// skips the first.  Reading `n` bytes here takes `n + 1` from the wire,
+// so `n` is at most 31.
+pub fn spi_read<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    dst.clear()
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg | 0x80) as u8)
+    var rx: DevBytes = Vec.new()
+    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n + 1, var rx)
+        return false
+    for i in 1..(n + 1)
+        let _ = dst.push(rx[i])
+    true
+
+// A register write over SPI: the address with bit 7 clear, then the
+// bytes.  At most 31 bytes.
+pub fn spi_write<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg & 0x7F) as u8)
+    if src.len() > 31
+        return false
+    for b in src
+        let _ = tx.push(b)
+    var rx: DevBytes = Vec.new()
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var rx)
+
+// The SPI wake-up read of section 6.3: CHIP_ID once, answer discarded.
+pub fn spi_wake<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring) [hw]
+    var d: DevBytes = Vec.new()
+    let _ = spi_read(bus, gpio, w, REG_CHIP_ID, 1, var d)
+
+// The link over a board's handles, to the I2C bus or the SPI bus its
+// wiring names.
+pub @value
+struct Bmi270Link
+    i2c: BoardI2c
+    spi: BoardSpi
+    gpio: BoardGpio
+    timer: BoardTimer
+    w: DeviceWiring
+
+impl BmiLink for Bmi270Link
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        if dev_bus.wiring_is_spi(self.w)
+            return spi_read(self.spi, self.gpio, self.w, reg, n, var dst)
+        i2c_read(self.i2c, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        if dev_bus.wiring_is_spi(self.w)
+            return spi_write(self.spi, self.gpio, self.w, reg, src)
+        i2c_write(self.i2c, self.w, reg, src)
+
+    fn link_wait(self, us: Int) [hw]
+        self.timer.delay_us(us)
+
+    fn link_wake(self) [hw]
+        if dev_bus.wiring_is_spi(self.w)
+            spi_wake(self.spi, self.gpio, self.w)
+
+    fn link_chunk(self) -> Int [hw]
+        if dev_bus.wiring_is_spi(self.w)
+            return 30
+        32
+
+// ── Register access, over any link ───────────────────────────────────
+
+// One register's byte, or `None`.
+pub fn reg_get<L: BmiLink>(l: L, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes one register and waits for the next write to be accepted.
+//
+// Fix kept: the wait is 450 us after every write, whatever the mode.  The
+// part's inter-write delay is 450 us in advanced power save mode, which
+// is the mode after power-up and in the low power and suspend modes, and
+// 2 us otherwise (Table 19); the Sensor API tracks the mode and picks
+// one.  The driver keeps no state, so it takes the longer wait, which is
+// safe in both, and uses the short one only in the configuration upload,
+// where the sequence has turned advanced power save off itself.
+pub fn reg_set<L: BmiLink>(l: L, reg: Int, v: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let _ = b.push((v & 0xFF) as u8)
+    let ok = l.link_write(reg, b)
+    l.link_wait(WRITE_GAP_US)
+    ok
+
+// Reads a register, clears the bits of `clear`, sets those of `set` and
+// writes it back.  Answers the byte written, or -1.
+pub fn reg_modify<L: BmiLink>(l: L, reg: Int, clear: Int, set: Int) -> Int [hw]
+    let Some(old) = reg_get(l, reg) else return -1
+    let next = (old & (0xFF ^ clear)) | set
+    if reg_set(l, reg, next)
+        return next
+    -1
+
+// A little-endian 16-bit word of `b` at `i`.
+fn word_le(b: DevBytes, i: Int) -> Int
+    (b[i] as Int) | ((b[i + 1] as Int) << 8)
+
+// ── Identity, reset and the configuration upload ─────────────────────
+
+// What the part says it is: CHIP_ID 0x24.  The part has no revision
+// register, so `rev` is `None`.  On SPI the first read after a reset
+// is invalid, so the link reads once and discards it first.
+pub fn identify<L: BmiLink>(l: L) -> ?DeviceId [hw]
+    l.link_wake()
+    let Some(id) = reg_get(l, REG_CHIP_ID) else return None
+    if id != CHIP_ID
+        return None
+    Some(DeviceId { who: id, rev: None })
+
+// Writes the 8192-byte configuration file to INIT_DATA in bursts of the
+// link's length, setting INIT_ADDR_0 and INIT_ADDR_1 before each burst to
+// the byte index divided by two (section 4.4, footnote 4).  Answers
+// whether the part took every write.  INIT_CTRL is not touched.
+//
+// Fix kept: the base address is set before every burst, even the first,
+// as the Sensor API's `upload_file` does, since INIT_DATA traps the
+// address and the part does not advance INIT_ADDR itself.
+pub fn upload_config<L: BmiLink>(l: L) -> Bool [hw]
+    let chunk = l.link_chunk()
+    let count = (CONFIG_LEN + chunk - 1) / chunk
+    for c in 0..count
+        let off = c * chunk
+        var n = chunk
+        if off + n > CONFIG_LEN
+            n = CONFIG_LEN - off
+        var a: DevBytes = Vec.new()
+        let words = off / 2
+        let _ = a.push((words & 0x0F) as u8)
+        let _ = a.push((words >> 4) as u8)
+        if not l.link_write(REG_INIT_ADDR, a)
+            return false
+        var d: DevBytes = Vec.new()
+        for i in 0..n
+            let _ = d.push(BMI270_CONFIG[off + i] as u8)
+        if not l.link_write(REG_INIT_DATA, d)
+            return false
+        l.link_wait(NORMAL_GAP_US)
+    true
+
+// Reads the configuration file back from INIT_DATA and compares it with
+// the bytes written (section 4.4, optional step).  Answers the count of
+// differing bytes, or -1 when the part did not answer.  Run it after
+// `upload_config` and before INIT_CTRL is set to 1.
+pub fn verify_config<L: BmiLink>(l: L) -> Int [hw]
+    let chunk = l.link_chunk()
+    let count = (CONFIG_LEN + chunk - 1) / chunk
+    var bad = 0
+    for c in 0..count
+        let off = c * chunk
+        var n = chunk
+        if off + n > CONFIG_LEN
+            n = CONFIG_LEN - off
+        var a: DevBytes = Vec.new()
+        let words = off / 2
+        let _ = a.push((words & 0x0F) as u8)
+        let _ = a.push((words >> 4) as u8)
+        if not l.link_write(REG_INIT_ADDR, a)
+            return -1
+        var d: DevBytes = Vec.new()
+        if not l.link_read(REG_INIT_DATA, n, var d)
+            return -1
+        for i in 0..n
+            if (d[i] as Int) != BMI270_CONFIG[off + i]
+                bad = bad + 1
+    bad
+
+// INTERNAL_STATUS.message: 1 when the configuration was taken, 0 while the
+// part is still starting, 2 to 7 for the errors of section 5.2.33.  `None`
+// when the part does not answer.
+pub fn init_message<L: BmiLink>(l: L) -> ?Int [hw]
+    let Some(s) = reg_get(l, REG_INTERNAL) else return None
+    Some(s & 0x0F)
+
+// Brings the part up (section 4.4) and answers 0, or a negative result:
+// -1 when CHIP_ID is not 0x24 or the part does not answer, -2 when a
+// write was refused, -3 when INTERNAL_STATUS did not read 1 within 20 ms.
+// On success the accelerometer, the gyroscope and the temperature sensor
+// are on in normal mode at the part's reset settings, +-8 g at 100 Hz
+// and +-2000 dps at 200 Hz, and the first samples are valid after the
+// gyroscope's start-up time, 45 ms, which this waits.
+//
+// The steps, and the fixes the reference drivers carry:
+//
+//   - On SPI, the interface is selected by a read of CHIP_ID, answer
+//     discarded.  The Sensor API and Zephyr's driver repeat it after
+//     the soft reset, so does this.
+//   - The soft reset comes first.  The part may hold a configuration
+//     from an earlier run, and "this operation must not be performed
+//     more than once after POR or soft reset".
+//   - Advanced power save is turned off, with its 450 us wait, before
+//     INIT_CTRL is touched.  Zephyr's driver writes PWR_CONF with
+//     the delay for the same reason.
+//   - The file is written with the address registers set before each
+//     burst, and INIT_CTRL is set to 1 after the last.
+//   - INTERNAL_STATUS is polled for 20 ms in steps of 1 ms.  The Sensor
+//     API waits 20 ms once and reads once; Zephyr polls 15 times at
+//     10 ms.  Polling returns as soon as the part is ready.
+pub fn start<L: BmiLink>(l: L) -> Int [hw]
+    l.link_wake()
+    let Some(id) = reg_get(l, REG_CHIP_ID) else return START_NO_PART
+    if id != CHIP_ID
+        return START_NO_PART
+    if not reg_set(l, REG_CMD, CMD_SOFT_RESET)
+        return START_BUS
+    l.link_wait(SOFT_RESET_US)
+    l.link_wake()
+    if not reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF)
+        return START_BUS
+    if not reg_set(l, REG_INIT_CTRL, 0x00)
+        return START_BUS
+    if not upload_config(l)
+        return START_BUS
+    if not reg_set(l, REG_INIT_CTRL, 0x01)
+        return START_BUS
+    var message = 0
+    for _k in 0..21
+        if message == 0
+            match init_message(l)
+                Some(m) =>
+                    message = m
+                None =>
+                    return START_BUS
+            if message == 0
+                l.link_wait(INIT_POLL_US)
+    if message != 1
+        return START_REFUSED
+    if not reg_set(l, REG_PWR_CTRL, PWR_CTRL_ALL)
+        return START_BUS
+    l.link_wait(GYRO_START_US)
+    START_OK
+
+// Resets the part (CMD 0xB6).  Every register returns to its reset value
+// and the configuration file is lost, so `start` must run again before the
+// sensors work.  Answers whether the part took the command.
+pub fn soft_reset<L: BmiLink>(l: L) -> Bool [hw]
+    let ok = reg_set(l, REG_CMD, CMD_SOFT_RESET)
+    l.link_wait(SOFT_RESET_US)
+    l.link_wake()
+    ok
+
+// ── Power modes ──────────────────────────────────────────────────────
+
+// Puts the part in one of the power modes of Table 6, in the order the
+// data sheet implies: advanced power save is turned off before the
+// sensors are configured and turned on after, so every write but the
+// last goes at the normal pace.  Answers whether the part took every
+// write.
+//
+//   - ModeSuspend: the sensors off, advanced power save on.
+//   - ModeConfiguration: the sensors off, advanced power save off.
+//   - ModeLowPower: the accelerometer and gyroscope on with their
+//     low-power filters, advanced power save on.  The rates are held to
+//     what the mode allows: the accelerometer 25/32 Hz to 400 Hz, the
+//     gyroscope 25, 50 and 100 Hz.
+//   - ModeNormal: both on with the performance filters, advanced power
+//     save off.  The rates are held to 12.5 Hz to 1600 Hz and 25 Hz to
+//     3200 Hz.
+//   - ModePerformance: ModeNormal with the gyroscope's low-noise mode on.
+//
+// The temperature sensor is on in every mode but suspend and
+// configuration.  A gyroscope turned on takes 45 ms to start, which this
+// waits.
+pub fn set_power_mode<L: BmiLink>(l: L, mode: PowerMode) -> Bool [hw]
+    match mode
+        PowerMode.ModeSuspend =>
+            reg_set(l, REG_PWR_CTRL, PWR_CTRL_NONE) and reg_set(l, REG_PWR_CONF, PWR_CONF_APS_ON)
+        PowerMode.ModeConfiguration =>
+            reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF) and reg_set(l, REG_PWR_CTRL, PWR_CTRL_NONE)
+        PowerMode.ModeLowPower =>
+            enter_low_power(l)
+        PowerMode.ModeNormal =>
+            enter_normal(l, false)
+        PowerMode.ModePerformance =>
+            enter_normal(l, true)
+
+// Low power mode: the filters to their power-optimised settings and the
+// rates into range, the sensors on, then advanced power save on.
+fn enter_low_power<L: BmiLink>(l: L) -> Bool [hw]
+    if not reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF)
+        return false
+    let Some(ac) = reg_get(l, REG_ACC_CONF) else return false
+    let Some(gc) = reg_get(l, REG_GYR_CONF) else return false
+    var ao = ac & 0x0F
+    if ao > 10
+        ao = 10
+    if ao < 1
+        ao = 1
+    var go = gc & 0x0F
+    if go > 8
+        go = 8
+    if go < 6
+        go = 6
+    if not reg_set(l, REG_ACC_CONF, (ac & 0x70) | ao)
+        return false
+    if not reg_set(l, REG_GYR_CONF, (gc & 0x30) | go)
+        return false
+    if not reg_set(l, REG_PWR_CTRL, PWR_CTRL_ALL)
+        return false
+    l.link_wait(GYRO_START_US)
+    reg_set(l, REG_PWR_CONF, PWR_CONF_APS_ON)
+
+// Normal mode, and the performance mode with the gyroscope's low-noise
+// bit.
+fn enter_normal<L: BmiLink>(l: L, low_noise: Bool) -> Bool [hw]
+    if not reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF)
+        return false
+    let Some(ac) = reg_get(l, REG_ACC_CONF) else return false
+    let Some(gc) = reg_get(l, REG_GYR_CONF) else return false
+    var ao = ac & 0x0F
+    if ao < 5
+        ao = 5
+    if ao > 12
+        ao = 12
+    var go = gc & 0x0F
+    if go < 6
+        go = 6
+    if go > 13
+        go = 13
+    var noise = 0
+    if low_noise
+        noise = 0x40
+    if not reg_set(l, REG_ACC_CONF, 0x80 | (ac & 0x70) | ao)
+        return false
+    if not reg_set(l, REG_GYR_CONF, 0x80 | noise | (gc & 0x30) | go)
+        return false
+    if not reg_set(l, REG_PWR_CTRL, PWR_CTRL_ALL)
+        return false
+    l.link_wait(GYRO_START_US)
+    true
+
+// ── Accelerometer and gyroscope settings ─────────────────────────────
+
+// The accelerometer range code, or `None`.
+pub fn acc_range_read<L: BmiLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_get(l, REG_ACC_RANGE) else return None
+    Some(v & 3)
+
+// Sets the accelerometer range; answers whether the part took it.  The
+// change applies at the next sample of the current rate (section 4.6.16).
+pub fn acc_range_write<L: BmiLink>(l: L, r: AccelRange) -> Bool [hw]
+    reg_set(l, REG_ACC_RANGE, acc_range_code(r))
+
+// The gyroscope range code, or `None`.
+pub fn gyr_range_read<L: BmiLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_get(l, REG_GYR_RANGE) else return None
+    Some(v & 7)
+
+// Sets the gyroscope range; answers whether the part took it.  The
+// register's OIS range bit (bit 3) is written as 0, its reset value.
+pub fn gyr_range_write<L: BmiLink>(l: L, r: GyroRange) -> Bool [hw]
+    reg_set(l, REG_GYR_RANGE, gyr_range_code(r))
+
+// Sets the gyroscope range to +-125 dps, which `GyroRange` has no value
+// for (code 4).
+pub fn gyr_range_write_125<L: BmiLink>(l: L) -> Bool [hw]
+    reg_set(l, REG_GYR_RANGE, 4)
+
+// The accelerometer output rate in thousandths of a hertz, or -1.
+pub fn acc_rate_mhz<L: BmiLink>(l: L) -> Int [hw]
+    let Some(c) = reg_get(l, REG_ACC_CONF) else return -1
+    acc_odr_mhz(c & 0x0F)
+
+// Sets the accelerometer rate to the slowest at or above `mhz` that the
+// current filter mode has, keeping the filter bits, and answers the rate
+// taken in thousandths of a hertz, or -1.
+pub fn acc_rate_write<L: BmiLink>(l: L, mhz: Int) -> Int [hw]
+    let Some(c) = reg_get(l, REG_ACC_CONF) else return -1
+    let code = acc_code_for(mhz, (c & 0x80) != 0)
+    if not reg_set(l, REG_ACC_CONF, (c & 0xF0) | code)
+        return -1
+    acc_odr_mhz(code)
+
+// The gyroscope output rate in thousandths of a hertz, or -1.
+pub fn gyr_rate_mhz<L: BmiLink>(l: L) -> Int [hw]
+    let Some(c) = reg_get(l, REG_GYR_CONF) else return -1
+    gyr_odr_mhz(c & 0x0F)
+
+// Sets the gyroscope rate to the slowest at or above `mhz` that the
+// current filter mode has, keeping the filter bits, and answers the rate
+// taken in thousandths of a hertz, or -1.
+pub fn gyr_rate_write<L: BmiLink>(l: L, mhz: Int) -> Int [hw]
+    let Some(c) = reg_get(l, REG_GYR_CONF) else return -1
+    let code = gyr_code_for(mhz, (c & 0x80) != 0)
+    if not reg_set(l, REG_GYR_CONF, (c & 0xF0) | code)
+        return -1
+    gyr_odr_mhz(code)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+// The most recent accelerometer sample in milli-g, converted at the
+// range the part holds.  The range and the sample are two reads; a range
+// written between them would scale the sample wrongly.  Reading starts
+// with the least significant byte of the first axis, which the part
+// latches the other bytes by (section 4.6.1).
+pub fn accel_sample<L: BmiLink>(l: L) -> ?AccelMilliG [hw]
+    let Some(rc) = acc_range_read(l) else return None
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_DATA_ACC, 6, var b)
+        return None
+    Some(AccelMilliG { x: accel_mg(word_le(b, 0), rc), y: accel_mg(word_le(b, 2), rc), z: accel_mg(word_le(b, 4), rc) })
+
+// The most recent gyroscope sample in milli-degrees per second.
+pub fn gyro_sample<L: BmiLink>(l: L) -> ?GyroMilliDps [hw]
+    let Some(rc) = gyr_range_read(l) else return None
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_DATA_GYR, 6, var b)
+        return None
+    Some(GyroMilliDps { x: gyro_mdps(word_le(b, 0), rc), y: gyro_mdps(word_le(b, 2), rc), z: gyro_mdps(word_le(b, 4), rc) })
+
+// The most recent accelerometer and gyroscope samples, read in one
+// transaction of 12 bytes from DATA_8 so that both describe one instant.
+// The two ranges come in a second transaction of three bytes, ACC_RANGE
+// to GYR_RANGE.
+pub fn imu_sample<L: BmiLink>(l: L) -> ?ImuSample [hw]
+    var r: DevBytes = Vec.new()
+    if not l.link_read(REG_ACC_RANGE, 3, var r)
+        return None
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_DATA_ACC, 12, var b)
+        return None
+    let ar = (r[0] as Int) & 3
+    let gr = (r[2] as Int) & 7
+    Some(ImuSample { accel: AccelMilliG { x: accel_mg(word_le(b, 0), ar), y: accel_mg(word_le(b, 2), ar), z: accel_mg(word_le(b, 4), ar) }, gyro: GyroMilliDps { x: gyro_mdps(word_le(b, 6), gr), y: gyro_mdps(word_le(b, 8), gr), z: gyro_mdps(word_le(b, 10), gr) } })
+
+// STATUS, or `None`.  Bit 7 is the accelerometer's data-ready flag and
+// bit 6 the gyroscope's.  A flag clears when the first data register of
+// its sensor is read.
+pub fn status_read<L: BmiLink>(l: L) -> ?Int [hw]
+    reg_get(l, REG_STATUS)
+
+// Whether the accelerometer has a sample since the last read.
+pub fn accel_ready<L: BmiLink>(l: L) -> Bool [hw]
+    let Some(s) = status_read(l) else return false
+    (s & 0x80) != 0
+
+// Whether the gyroscope has a sample since the last read.
+pub fn gyro_ready<L: BmiLink>(l: L) -> Bool [hw]
+    let Some(s) = status_read(l) else return false
+    (s & 0x40) != 0
+
+// The temperature in thousandths of a degree Celsius, or `None` when the
+// part did not answer or has not completed a measurement (the word reads
+// 0x8000).  The sensor is on while any sensor is, and is updated every
+// 10 ms with the gyroscope in normal mode and every 1.28 s otherwise.
+pub fn temperature<L: BmiLink>(l: L) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_TEMPERATURE, 2, var b)
+        return None
+    temp_milli_c(word_le(b, 0))
+
+// The temperature as devices-nv's reading, or `None`.
+pub fn temperature_reading<L: BmiLink>(l: L) -> ?TempMilliC [hw]
+    match temperature(l)
+        Some(m) => Some(TempMilliC { milli_c: m })
+        None    => None
+
+// ERR_REG, or `None`.  Bit 0 is fatal_err: the part is not operational
+// and only a reset clears it.  The gyroscope's start-up self-check reports
+// through it within 320 ms of the gyroscope being turned on (section
+// 4.12.2).  The register clears when read.
+pub fn error_status<L: BmiLink>(l: L) -> ?Int [hw]
+    reg_get(l, REG_ERR)
+
+// ── Interrupt pins ───────────────────────────────────────────────────
+
+// Configures an interrupt pin, 1 or 2, as an output: active high or
+// low, push-pull or open-drain.  Answers whether the part took it.
+pub fn int_pin_config<L: BmiLink>(l: L, pin: Int, active_high: Bool, open_drain: Bool) -> Bool [hw]
+    var v = 0x08
+    if active_high
+        v = v | 0x02
+    if open_drain
+        v = v | 0x04
+    if pin == 2
+        return reg_set(l, REG_INT2_IO, v)
+    if pin == 1
+        return reg_set(l, REG_INT1_IO, v)
+    false
+
+// Maps the data-ready interrupt of both sensors to an interrupt pin, 1 or
+// 2 (INT_MAP_DATA bits 2 and 6), or unmaps it.  The pin's output must be
+// enabled with `int_pin_config`.  Answers whether the part took it.
+pub fn int_map_data_ready<L: BmiLink>(l: L, pin: Int, on: Bool) -> Bool [hw]
+    var bit = 0x04
+    if pin == 2
+        bit = 0x40
+    if pin != 1 and pin != 2
+        return false
+    if on
+        return reg_modify(l, REG_INT_MAP, 0, bit) >= 0
+    reg_modify(l, REG_INT_MAP, bit, 0) >= 0
+
+// Latches the interrupts until INT_STATUS is read, or not.  Without the
+// latch the data-ready line is cleared automatically after 1/6400 s.
+pub fn int_latch<L: BmiLink>(l: L, on: Bool) -> Bool [hw]
+    var v = 0
+    if on
+        v = 1
+    reg_set(l, REG_INT_LATCH, v)
+
+// INT_STATUS_1, or `None`: bit 7 accelerometer data ready, bit 6
+// gyroscope data ready, bit 2 error, bit 1 FIFO watermark, bit 0 FIFO
+// full.  The register clears when read.
+pub fn int_status<L: BmiLink>(l: L) -> ?Int [hw]
+    reg_get(l, REG_INT_STATUS1)
+
+// The level of the interrupt line the wiring names, or -1.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+// Sets the FIFO to collect the accelerometer, the gyroscope or both in
+// headerless mode and flushes it.  A headerless frame holds the gyroscope's
+// six bytes and then the accelerometer's six, whichever are enabled
+// (section 4.7.1), so the frame is 6 or 12 bytes.  Answers whether the part
+// took the writes.
+//
+// Headerless mode needs the sensors to run at the same rate.  Any change
+// that alters the frame flushes the FIFO.
+pub fn fifo_enable<L: BmiLink>(l: L, acc: Bool, gyr: Bool) -> Bool [hw]
+    var v = 0
+    if acc
+        v = v | 0x40
+    if gyr
+        v = v | 0x80
+    reg_set(l, REG_FIFO_CFG1, v) and reg_set(l, REG_CMD, CMD_FIFO_FLUSH)
+
+// The FIFO fill level in bytes, 14 bits, or `None`.
+pub fn fifo_bytes<L: BmiLink>(l: L) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(REG_FIFO_LENGTH, 2, var b)
+        return None
+    Some(word_le(b, 0) & 0x3FFF)
+
+// The frame size the FIFO is set to, in bytes: 6 for one sensor, 12 for
+// both, 0 when no sensor is on or the FIFO is in header mode, which this
+// driver does not read.
+pub fn fifo_frame_size<L: BmiLink>(l: L) -> Int [hw]
+    let Some(c) = reg_get(l, REG_FIFO_CFG1) else return 0
+    if (c & 0x10) != 0
+        return 0
+    var size = 0
+    if (c & 0x40) != 0
+        size = size + 6
+    if (c & 0x80) != 0
+        size = size + 6
+    size
+
+// The number of whole frames the FIFO holds, 0 when the FIFO is not set to
+// a frame this driver reads or the part does not answer.
+pub fn fifo_frame_count<L: BmiLink>(l: L) -> Int [hw]
+    let size = fifo_frame_size(l)
+    if size == 0
+        return 0
+    (fifo_bytes(l) ?? 0) / size
+
+// Moves up to 32 whole accelerometer frames out of the FIFO, oldest
+// first, into `dst`, and answers how many.  `dst` is emptied first.  A
+// frame with both sensors is read whole and its gyroscope half skipped.
+//
+// Fix kept: only whole frames are read.  A frame read in part is repeated
+// whole at the next access (section 4.7.2), and a read of more bytes than
+// the FIFO holds returns 0x8000 words, so the driver reads the fill
+// level first and never asks for more.  The Sensor API reads the level
+// into `fifo->length` for the same reason.
+pub fn fifo_read_accel<L: BmiLink>(l: L, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+    dst.clear()
+    let size = fifo_frame_size(l)
+    let Some(cfg) = reg_get(l, REG_FIFO_CFG1) else return 0
+    if size == 0 or (cfg & 0x40) == 0
+        return 0
+    let Some(fill) = fifo_bytes(l) else return 0
+    let Some(rc) = acc_range_read(l) else return 0
+    var frames = fill / size
+    if frames > 32
+        frames = 32
+    // The accelerometer's bytes are the last six of a frame.
+    let at = size - 6
+    let per = 30 / size
+    var left = frames
+    for _k in 0..32
+        if left > 0
+            var take = per
+            if take > left
+                take = left
+            var b: DevBytes = Vec.new()
+            if not l.link_read(REG_FIFO_DATA, take * size, var b)
+                return dst.len()
+            for f in 0..take
+                let o = f * size + at
+                let _ = dst.push(AccelMilliG { x: accel_mg(word_le(b, o), rc), y: accel_mg(word_le(b, o + 2), rc), z: accel_mg(word_le(b, o + 4), rc) })
+            left = left - take
+    dst.len()
+
+// ── Self-tests ───────────────────────────────────────────────────────
+
+// The accelerometer's self-test (section 4.12.1).  The part is excited
+// with a positive and then a negative electrostatic force and the
+// difference of the two readings is compared with the data sheet's
+// minimum: more than 16 g on x, less than -15 g on y, more than 10 g on
+// z.  The board must be still.  Answers 0 when every axis passes, a
+// mask of the failing axes (1 x, 2 y, 4 z) when one does not, and -1 when
+// the part did not answer.
+//
+// The test leaves the accelerometer at +-16 g, 1600 Hz and the
+// self-test off; the data sheet recommends a reset after it, which is
+// `soft_reset` and then `start`.
+pub fn accel_self_test<L: BmiLink>(l: L) -> Int [hw]
+    if not (reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF) and reg_set(l, REG_PWR_CTRL, PWR_CTRL_ACC))
+        return -1
+    if not (reg_set(l, REG_ACC_RANGE, 3) and reg_set(l, REG_ACC_ST, 0x08))
+        return -1
+    // 1600 Hz, normal filter, performance mode.
+    if not reg_set(l, REG_ACC_CONF, 0xAC)
+        return -1
+    l.link_wait(3000)
+    if not (reg_set(l, REG_ACC_ST, 0x0C) and reg_set(l, REG_ACC_ST, 0x0D))
+        return -1
+    l.link_wait(55000)
+    var p: DevBytes = Vec.new()
+    if not l.link_read(REG_DATA_ACC, 6, var p)
+        return -1
+    if not reg_set(l, REG_ACC_ST, 0x09)
+        return -1
+    l.link_wait(55000)
+    var n: DevBytes = Vec.new()
+    if not l.link_read(REG_DATA_ACC, 6, var n)
+        return -1
+    if not reg_set(l, REG_ACC_ST, 0x00)
+        return -1
+    let dx = accel_mg(word_le(p, 0), 3) - accel_mg(word_le(n, 0), 3)
+    let dy = accel_mg(word_le(p, 2), 3) - accel_mg(word_le(n, 2), 3)
+    let dz = accel_mg(word_le(p, 4), 3) - accel_mg(word_le(n, 4), 3)
+    var mask = 0
+    if dx <= 16000
+        mask = mask | 1
+    if dy >= -15000
+        mask = mask | 2
+    if dz <= 10000
+        mask = mask | 4
+    mask
+
+// The gyroscope's self-test (section 4.12.2): the g_trigger command with
+// G_TRIG_1 set to the built-in self-test and no download.  The part is
+// to be freshly initialised (`start`), at rest.  Answers 0 when every
+// axis reports ok, a mask of the axes that do not (1 x, 2 y, 4 z), -1
+// when the part did not answer, -2 when the test was not done within
+// two seconds, and -3 when GYR_GAIN_STATUS reports an error of the
+// command (the precondition was not met, the download failed or it was
+// aborted).
+pub fn gyro_self_test<L: BmiLink>(l: L) -> Int [hw]
+    if not (reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF) and reg_set(l, REG_PWR_CTRL, PWR_CTRL_ACC))
+        return -1
+    l.link_wait(2000)
+    // G_TRIG_1 is at 0x32 on feature page 1: the burst length 0 and the
+    // select and block bits 0 (gyroscope self-test, not blocked).
+    var g: DevBytes = Vec.new()
+    let _ = g.push(0x00 as u8)
+    let _ = g.push(0x00 as u8)
+    if not reg_set(l, REG_FEAT_PAGE, 1)
+        return -1
+    if not l.link_write(REG_FEATURES + 2, g)
+        return -1
+    l.link_wait(WRITE_GAP_US)
+    if not reg_set(l, REG_FEAT_PAGE, 0)
+        return -1
+    if not reg_set(l, REG_CMD, CMD_G_TRIGGER)
+        return -1
+    var done = false
+    var axes = 0
+    for _k in 0..200
+        if not done
+            let Some(s) = reg_get(l, REG_GYR_ST) else return -1
+            if (s & 0x01) != 0
+                done = true
+                axes = s
+            else
+                l.link_wait(10000)
+    if not done
+        return -2
+    // GYR_GAIN_STATUS is at 0x38 on feature page 0; its bits 5 to 3 are
+    // the status of the command.
+    var st: DevBytes = Vec.new()
+    if not l.link_read(REG_FEATURES + 8, 2, var st)
+        return -1
+    if (((st[0] as Int) >> 3) & 7) != 0
+        return -3
+    var mask = 0
+    if (axes & 0x02) == 0
+        mask = mask | 1
+    if (axes & 0x04) == 0
+        mask = mask | 2
+    if (axes & 0x08) == 0
+        mask = mask | 4
+    mask
+
+// ── The part on a board ──────────────────────────────────────────────
+
+// A BMI270 on a board's I2C bus at the address `w.addr`, 0x68 or 0x69.
+pub @value
+struct Bmi270
+    link: Bmi270Link
+
+// A BMI270 on a board's SPI bus, selected by the pin `w.cs`.
+pub @value
+struct Bmi270Spi
+    link: Bmi270Link
+
+impl Bmi270
+    // The part at `w.addr` on the board's I2C bus, as the board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Bmi270
+        Bmi270 { link: Bmi270Link { i2c: bus, spi: BoardSpi { id: 0 }, gpio: pins, timer: BoardTimer { id: 0 }, w: w } }
+
+    // The link, for the functions of this module that take one.
+    fn as_link(self) -> Bmi270Link
+        self.link
+
+    // Brings the part up (`start`): whether it answered as a BMI270 and
+    // took the configuration file.
+    fn begin(self) -> Bool [hw]
+        start(self.link) == START_OK
+
+    // The result of `start`: 0, -1 no part, -2 a refused write, -3 the
+    // configuration not taken.
+    fn begin_code(self) -> Int [hw]
+        start(self.link)
+
+    // Sets a power mode.
+    fn set_power_mode(self, mode: PowerMode) -> Bool [hw]
+        set_power_mode(self.link, mode)
+
+    // Sets the FIFO to collect the accelerometer, the gyroscope or both.
+    fn fifo_enable(self, acc: Bool, gyr: Bool) -> Bool [hw]
+        fifo_enable(self.link, acc, gyr)
+
+    // Maps the data-ready interrupt to INT1 or INT2, active high and
+    // push-pull.
+    fn map_data_ready(self, pin: Int) -> Bool [hw]
+        int_pin_config(self.link, pin, true, false) and int_map_data_ready(self.link, pin, true)
+
+    // The accelerometer's self-test; 0 passes.
+    fn accel_self_test(self) -> Int [hw]
+        accel_self_test(self.link)
+
+    // The gyroscope's self-test; 0 passes.
+    fn gyro_self_test(self) -> Int [hw]
+        gyro_self_test(self.link)
+
+    // The level of the interrupt line, -1 when the wiring has none.
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.link.gpio, self.link.w)
+
+impl Bmi270Spi
+    // The part selected by `w.cs` on the board's SPI bus.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Bmi270Spi
+        Bmi270Spi { link: Bmi270Link { i2c: BoardI2c { id: 0 }, spi: bus, gpio: pins, timer: BoardTimer { id: 0 }, w: w } }
+
+    // The link, for the functions of this module that take one.
+    fn as_link(self) -> Bmi270Link
+        self.link
+
+    fn begin(self) -> Bool [hw]
+        start(self.link) == START_OK
+
+    fn begin_code(self) -> Int [hw]
+        start(self.link)
+
+    fn set_power_mode(self, mode: PowerMode) -> Bool [hw]
+        set_power_mode(self.link, mode)
+
+    fn fifo_enable(self, acc: Bool, gyr: Bool) -> Bool [hw]
+        fifo_enable(self.link, acc, gyr)
+
+    fn map_data_ready(self, pin: Int) -> Bool [hw]
+        int_pin_config(self.link, pin, true, false) and int_map_data_ready(self.link, pin, true)
+
+    fn accel_self_test(self) -> Int [hw]
+        accel_self_test(self.link)
+
+    fn gyro_self_test(self) -> Int [hw]
+        gyro_self_test(self.link)
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.link.gpio, self.link.w)
+
+impl Accelerometer[hw] for Bmi270
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        accel_sample(self.link)
+
+    fn accel_ready(self) -> Bool [hw]
+        accel_ready(self.link)
+
+    fn accel_range(self) -> AccelRange [hw]
+        acc_range_of(acc_range_read(self.link) ?? 2)
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        acc_range_write(self.link, r)
+
+    // The rate in whole hertz, rounded to the nearest, 0 when the part
+    // did not answer.
+    fn accel_rate_hz(self) -> Int [hw]
+        (acc_rate_mhz(self.link) + 500) / 1000
+
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        (acc_rate_write(self.link, hz * 1000) + 500) / 1000
+
+    fn accel_fifo_count(self) -> Int [hw]
+        fifo_frame_count(self.link)
+
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+        fifo_read_accel(self.link, var dst)
+
+impl Gyroscope[hw] for Bmi270
+    fn gyro_read(self) -> ?GyroMilliDps [hw]
+        gyro_sample(self.link)
+
+    fn gyro_ready(self) -> Bool [hw]
+        gyro_ready(self.link)
+
+    fn gyro_range(self) -> GyroRange [hw]
+        gyr_range_of(gyr_range_read(self.link) ?? 0)
+
+    fn gyro_set_range(self, r: GyroRange) -> Bool [hw]
+        gyr_range_write(self.link, r)
+
+    fn gyro_rate_hz(self) -> Int [hw]
+        (gyr_rate_mhz(self.link) + 500) / 1000
+
+impl Imu[hw] for Bmi270
+    fn imu_read(self) -> ?ImuSample [hw]
+        imu_sample(self.link)
+
+impl Thermometer[hw] for Bmi270
+    // The temperature is measured whenever a sensor is on; nothing to
+    // start.
+    fn temp_start(self) -> Int [hw]
+        0
+
+    fn temp_read(self) -> ?TempMilliC [hw]
+        temperature_reading(self.link)
+
+impl Identifiable[hw] for Bmi270
+    fn device_id(self) -> ?DeviceId [hw]
+        identify(self.link)
+
+impl Accelerometer[hw] for Bmi270Spi
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        accel_sample(self.link)
+
+    fn accel_ready(self) -> Bool [hw]
+        accel_ready(self.link)
+
+    fn accel_range(self) -> AccelRange [hw]
+        acc_range_of(acc_range_read(self.link) ?? 2)
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        acc_range_write(self.link, r)
+
+    fn accel_rate_hz(self) -> Int [hw]
+        (acc_rate_mhz(self.link) + 500) / 1000
+
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        (acc_rate_write(self.link, hz * 1000) + 500) / 1000
+
+    fn accel_fifo_count(self) -> Int [hw]
+        fifo_frame_count(self.link)
+
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+        fifo_read_accel(self.link, var dst)
+
+impl Gyroscope[hw] for Bmi270Spi
+    fn gyro_read(self) -> ?GyroMilliDps [hw]
+        gyro_sample(self.link)
+
+    fn gyro_ready(self) -> Bool [hw]
+        gyro_ready(self.link)
+
+    fn gyro_range(self) -> GyroRange [hw]
+        gyr_range_of(gyr_range_read(self.link) ?? 0)
+
+    fn gyro_set_range(self, r: GyroRange) -> Bool [hw]
+        gyr_range_write(self.link, r)
+
+    fn gyro_rate_hz(self) -> Int [hw]
+        (gyr_rate_mhz(self.link) + 500) / 1000
+
+impl Imu[hw] for Bmi270Spi
+    fn imu_read(self) -> ?ImuSample [hw]
+        imu_sample(self.link)
+
+impl Thermometer[hw] for Bmi270Spi
+    fn temp_start(self) -> Int [hw]
+        0
+
+    fn temp_read(self) -> ?TempMilliC [hw]
+        temperature_reading(self.link)
+
+impl Identifiable[hw] for Bmi270Spi
+    fn device_id(self) -> ?DeviceId [hw]
+        identify(self.link)
