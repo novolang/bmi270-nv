@@ -55,29 +55,29 @@ struct Chip
     pay: HashMap<Int, Int>
 
 // Keys of the state map.
-let K_CLOCK = 0
-let K_LAST_WRITE = 1
-let K_VIOLATIONS = 2
-let K_AWAKE = 3
-let K_BURSTS = 4
-let K_MAXBURST = 5
-let K_BADADDR = 6
-let K_NEXT = 7
-let K_POLLS = 8
-let K_CORRUPT = 9
-let K_RESETS = 10
-let K_HEAD = 11
-let K_FLEN = 12
-let K_PAGE = 13
-let K_SPI = 14
-let K_SPI_POS = 15
-let K_SPI_CMD = 16
-let K_SPI_READ = 17
-let K_ST_SCALE = 18
-let K_ST_STATUS = 19
-let K_ST_AXES = 20
+let K_CLOCK       = 0
+let K_LAST_WRITE  = 1
+let K_VIOLATIONS  = 2
+let K_AWAKE       = 3
+let K_BURSTS      = 4
+let K_MAXBURST    = 5
+let K_BADADDR     = 6
+let K_NEXT        = 7
+let K_POLLS       = 8
+let K_CORRUPT     = 9
+let K_RESETS      = 10
+let K_HEAD        = 11
+let K_FLEN        = 12
+let K_PAGE        = 13
+let K_SPI         = 14
+let K_SPI_POS     = 15
+let K_SPI_CMD     = 16
+let K_SPI_READ    = 17
+let K_ST_SCALE    = 18
+let K_ST_STATUS   = 19
+let K_ST_AXES     = 20
 let K_INIT_WRITES = 21
-let K_WAKES = 22
+let K_WAKES       = 22
 
 fn at(m: HashMap<Int, Int>, k: Int) -> Int
     m.get(k) ?? 0
@@ -117,7 +117,15 @@ fn power_up(c: Chip, spi: Bool)
         c.st.insert(K_AWAKE, 1)
 
 fn new_chip(spi: Bool) -> Chip
-    let c = Chip { regs: HashMap.new(), page1: HashMap.new(), blob: HashMap.new(), fifo: HashMap.new(), st: HashMap.new(), log: HashMap.new(), mute: HashMap.new(), deaf: HashMap.new(), pay: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        page1: HashMap.new(),
+        blob: HashMap.new(),
+        fifo: HashMap.new(),
+        st: HashMap.new(),
+        log: HashMap.new(),
+        mute: HashMap.new(),
+        deaf: HashMap.new(),
+        pay: HashMap.new() }
     c.st.insert(K_SPI, 0)
     if spi
         c.st.insert(K_SPI, 1)
@@ -137,7 +145,7 @@ fn get16(c: Chip, reg: Int) -> Int
 
 // The base of INIT_DATA in bytes: INIT_ADDR in words, 4 bits and 8 bits.
 fn init_base(c: Chip) -> Int
-    (((at(c.regs, 0x5C) << 4) | (at(c.regs, 0x5B) & 0x0F)) * 2)
+    ((at(c.regs, 0x5C) << 4) | (at(c.regs, 0x5B) & 0x0F)) * 2
 
 // Whether the file in the part is the file, byte for byte.
 fn blob_ok(c: Chip) -> Bool
@@ -303,7 +311,7 @@ impl I2cBus for FakeI2c
         if at(self.c.mute, data[0] as Int) != 0
             return false
         // A write of this value to this register is refused.
-        if data.len() > 1 and at(self.c.mute, 0x10000 + (data[0] as Int) * 256 + (data[1] as Int)) != 0
+        if data.len() > 1 and at(self.c.mute, 0x10000 + data[0] as Int * 256 + data[1] as Int) != 0
             return false
         chip_write(self.c, data[0] as Int, rest)
         true
@@ -381,7 +389,7 @@ impl GpioOut for FakePins
             let pos = at(c.st, K_SPI_POS)
             if pos > 1 and (cmd & 0x80) == 0
                 var data: [u8] = []
-                for i in 0..(pos - 1)
+                for i in 0..pos - 1
                     list.push(data, at(c.pay, i) as u8)
                 chip_write(c, cmd & 0x7F, data)
             c.st.insert(K_SPI_POS, 0)
@@ -453,14 +461,21 @@ impl BmiLink for SpiTestLink
         30
 
 fn i2c_link(c: Chip) -> I2cTestLink
-    I2cTestLink { bus: FakeI2c { c: c, addr: 0x68 }, timer: FakeTimer { c: c }, w: dev_bus.wiring_i2c(0, 0x68) }
+    I2cTestLink { bus: FakeI2c { c: c, addr: 0x68 },
+        timer: FakeTimer { c: c },
+        w: dev_bus.wiring_i2c(0, 0x68) }
 
 fn spi_link(c: Chip) -> SpiTestLink
-    SpiTestLink { bus: FakeSpi { c: c }, pins: FakePins { c: c }, timer: FakeTimer { c: c }, w: dev_bus.wiring_spi(0, 9) }
+    SpiTestLink { bus: FakeSpi { c: c },
+        pins: FakePins { c: c },
+        timer: FakeTimer { c: c },
+        w: dev_bus.wiring_spi(0, 9) }
 
 // An I2C link to a part that is not there.
 fn absent_link(c: Chip) -> I2cTestLink
-    I2cTestLink { bus: FakeI2c { c: c, addr: 0x69 }, timer: FakeTimer { c: c }, w: dev_bus.wiring_i2c(0, 0x68) }
+    I2cTestLink { bus: FakeI2c { c: c, addr: 0x69 },
+        timer: FakeTimer { c: c },
+        w: dev_bus.wiring_i2c(0, 0x68) }
 
 // ── Conversions ──────────────────────────────────────────────────────
 
@@ -592,11 +607,11 @@ fn test_the_identity_is_chip_id_0x24_on_both_buses() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x24)
             test.assert(id.rev == None)
-        None => test.assert(false)
+        None     => test.assert(false)
     let s = new_chip(true)
     match bmi270.identify(spi_link(s))
         Some(id) => test.assert_eq(id.who, 0x24)
-        None => test.assert(false)
+        None     => test.assert(false)
     // On SPI the first read woke the interface and the second was valid.
     test.assert_eq(at(s.st, K_WAKES), 1)
 
@@ -955,17 +970,17 @@ fn test_a_sample_is_converted_at_the_range_it_was_taken() [io, hw]
         Some(a) =>
             test.assert_eq(a.x, 0)
             test.assert_eq(a.z, 1000)
-        None => test.assert(false)
+        None    => test.assert(false)
     match bmi270.gyro_sample(l)
         Some(g) =>
             test.assert_eq(g.x, 1000000)
             test.assert_eq(g.z, -2000000)
-        None => test.assert(false)
+        None    => test.assert(false)
     // At +-2 g the same count is 0.25 g.
     test.assert(bmi270.acc_range_write(l, AccelRange2g))
     match bmi270.accel_sample(l)
         Some(a) => test.assert_eq(a.z, 250)
-        None => test.assert(false)
+        None    => test.assert(false)
     c.deaf.insert(0x0C, 1)
     test.assert(bmi270.accel_sample(l) == None)
     c.deaf.insert(0x41, 1)
@@ -997,7 +1012,7 @@ fn test_the_paired_sample_is_one_read_of_twelve_bytes() [io, hw]
             test.assert_eq(s.gyro.x, 7)
             test.assert_eq(s.gyro.y, 15)
             test.assert_eq(s.gyro.z, 22)
-        None => test.assert(false)
+        None    => test.assert(false)
     c.deaf.insert(0x0C, 1)
     test.assert(bmi270.imu_sample(l) == None)
     c.deaf.insert(0x41, 1)
@@ -1437,7 +1452,7 @@ fn test_the_fifo_count_and_the_temperature_reading() [io, hw]
     put16(c, 0x22, 0x0200)
     match bmi270.temperature_reading(l)
         Some(t) => test.assert_eq(t.milli_c, 24000)
-        None => test.assert(false)
+        None    => test.assert(false)
     c.deaf.insert(0x22, 1)
     test.assert(bmi270.temperature_reading(l) == None)
 

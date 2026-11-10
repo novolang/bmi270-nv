@@ -91,7 +91,7 @@ let REG_CMD         = 0x7E
 let CHIP_ID = 0x24
 
 // CMD (section 5.2.86).
-let CMD_G_TRIGGER = 0x02
+let CMD_G_TRIGGER  = 0x02
 let CMD_FIFO_FLUSH = 0xB0
 let CMD_SOFT_RESET = 0xB6
 
@@ -101,8 +101,8 @@ let PWR_CONF_APS_OFF = 0x02
 let PWR_CONF_APS_ON  = 0x03
 
 // PWR_CTRL: the temperature sensor, the accelerometer and the gyroscope.
-let PWR_CTRL_ALL = 0x0E
-let PWR_CTRL_ACC = 0x04
+let PWR_CTRL_ALL  = 0x0E
+let PWR_CTRL_ACC  = 0x04
 let PWR_CTRL_NONE = 0x00
 
 // Waits in microseconds.  The first two are the data sheet's: 450 us
@@ -110,17 +110,17 @@ let PWR_CTRL_NONE = 0x00
 // 4.5) and 2 us otherwise (Table 19), and the soft reset's 2 ms from the
 // Sensor API.  The start-ups are Tables 2 and 3: 2 ms for the
 // accelerometer and 45 ms for the gyroscope from suspend.
-let WRITE_GAP_US    = 450
-let NORMAL_GAP_US   = 2
-let SOFT_RESET_US   = 2000
-let GYRO_START_US   = 45000
-let INIT_POLL_US    = 1000
+let WRITE_GAP_US  = 450
+let NORMAL_GAP_US = 2
+let SOFT_RESET_US = 2000
+let GYRO_START_US = 45000
+let INIT_POLL_US  = 1000
 
 // The results of `start`.
-let START_OK       = 0
-let START_NO_PART  = -1
-let START_BUS      = -2
-let START_REFUSED  = -3
+let START_OK      = 0
+let START_NO_PART = -1
+let START_BUS     = -2
+let START_REFUSED = -3
 
 // The power modes of Table 6.
 pub @value
@@ -214,19 +214,19 @@ pub fn temp_milli_c(word: Int) -> ?Int
 // 1600 Hz.  The codes 0 and 13 to 15 are reserved.
 pub fn acc_odr_mhz(code: Int) -> Int
     match code & 15
-        1 => 781
-        2 => 1562
-        3 => 3125
-        4 => 6250
-        5 => 12500
-        6 => 25000
-        7 => 50000
-        8 => 100000
-        9 => 200000
+        1  => 781
+        2  => 1562
+        3  => 3125
+        4  => 6250
+        5  => 12500
+        6  => 25000
+        7  => 50000
+        8  => 100000
+        9  => 200000
         10 => 400000
         11 => 800000
         12 => 1600000
-        _ => -1
+        _  => -1
 
 // The output data rate of a GYR_CONF code in thousandths of a hertz, or
 // -1 for a reserved code (section 5.2.43): 6 is 25 Hz, up to 13 for
@@ -325,7 +325,8 @@ pub trait BmiLink
 
 // A register read over I2C: the register address, a repeated start and
 // the bytes.  The part has no dummy byte on I2C.
-pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                           var dst: DevBytes) -> Bool [hw]
     dev_bus.wiring_read_into(bus, w, reg, n, var dst)
 
 // A register write over I2C: the register address and the bytes in one
@@ -339,20 +340,22 @@ pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) ->
 // dropped" (section 6.4); Bosch's API reads `len + dummy_byte` and
 // skips the first.  Reading `n` bytes here takes `n + 1` from the wire,
 // so `n` is at most 31.
-pub fn spi_read<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                       var dst: DevBytes) -> Bool [hw]
     dst.clear()
     var tx: DevBytes = Vec.new()
     let _ = tx.push((reg | 0x80) as u8)
     var rx: DevBytes = Vec.new()
     if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n + 1, var rx)
         return false
-    for i in 1..(n + 1)
+    for i in 1..n + 1
         let _ = dst.push(rx[i])
     true
 
 // A register write over SPI: the address with bit 7 clear, then the
 // bytes.  At most 31 bytes.
-pub fn spi_write<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+pub fn spi_write<S: SpiBus, G: GpioOut>(bus: S, gpio: G, w: DeviceWiring, reg: Int,
+                                        src: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push((reg & 0x7F) as u8)
     if src.len() > 31
@@ -436,7 +439,7 @@ pub fn reg_modify<L: BmiLink>(l: L, reg: Int, clear: Int, set: Int) -> Int [hw]
 
 // A little-endian 16-bit word of `b` at `i`.
 fn word_le(b: DevBytes, i: Int) -> Int
-    (b[i] as Int) | ((b[i + 1] as Int) << 8)
+    b[i] as Int | (b[i + 1] as Int << 8)
 
 // ── Identity, reset and the configuration upload ─────────────────────
 
@@ -561,7 +564,7 @@ pub fn start<L: BmiLink>(l: L) -> Int [hw]
             match init_message(l)
                 Some(m) =>
                     message = m
-                None =>
+                None    =>
                     return START_BUS
             if message == 0
                 l.link_wait(INIT_POLL_US)
@@ -605,15 +608,15 @@ pub fn soft_reset<L: BmiLink>(l: L) -> Bool [hw]
 // waits.
 pub fn set_power_mode<L: BmiLink>(l: L, mode: PowerMode) -> Bool [hw]
     match mode
-        PowerMode.ModeSuspend =>
+        PowerMode.ModeSuspend       =>
             reg_set(l, REG_PWR_CTRL, PWR_CTRL_NONE) and reg_set(l, REG_PWR_CONF, PWR_CONF_APS_ON)
         PowerMode.ModeConfiguration =>
             reg_set(l, REG_PWR_CONF, PWR_CONF_APS_OFF) and reg_set(l, REG_PWR_CTRL, PWR_CTRL_NONE)
-        PowerMode.ModeLowPower =>
+        PowerMode.ModeLowPower      =>
             enter_low_power(l)
-        PowerMode.ModeNormal =>
+        PowerMode.ModeNormal        =>
             enter_normal(l, false)
-        PowerMode.ModePerformance =>
+        PowerMode.ModePerformance   =>
             enter_normal(l, true)
 
 // Low power mode: the filters to their power-optimised settings and the
@@ -740,7 +743,9 @@ pub fn accel_sample<L: BmiLink>(l: L) -> ?AccelMilliG [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(REG_DATA_ACC, 6, var b)
         return None
-    Some(AccelMilliG { x: accel_mg(word_le(b, 0), rc), y: accel_mg(word_le(b, 2), rc), z: accel_mg(word_le(b, 4), rc) })
+    Some(AccelMilliG { x: accel_mg(word_le(b, 0), rc),
+        y: accel_mg(word_le(b, 2), rc),
+        z: accel_mg(word_le(b, 4), rc) })
 
 // The most recent gyroscope sample in milli-degrees per second.
 pub fn gyro_sample<L: BmiLink>(l: L) -> ?GyroMilliDps [hw]
@@ -748,7 +753,9 @@ pub fn gyro_sample<L: BmiLink>(l: L) -> ?GyroMilliDps [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(REG_DATA_GYR, 6, var b)
         return None
-    Some(GyroMilliDps { x: gyro_mdps(word_le(b, 0), rc), y: gyro_mdps(word_le(b, 2), rc), z: gyro_mdps(word_le(b, 4), rc) })
+    Some(GyroMilliDps { x: gyro_mdps(word_le(b, 0), rc),
+        y: gyro_mdps(word_le(b, 2), rc),
+        z: gyro_mdps(word_le(b, 4), rc) })
 
 // The most recent accelerometer and gyroscope samples, read in one
 // transaction of 12 bytes from DATA_8 so that both describe one instant.
@@ -761,9 +768,14 @@ pub fn imu_sample<L: BmiLink>(l: L) -> ?ImuSample [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(REG_DATA_ACC, 12, var b)
         return None
-    let ar = (r[0] as Int) & 3
-    let gr = (r[2] as Int) & 7
-    Some(ImuSample { accel: AccelMilliG { x: accel_mg(word_le(b, 0), ar), y: accel_mg(word_le(b, 2), ar), z: accel_mg(word_le(b, 4), ar) }, gyro: GyroMilliDps { x: gyro_mdps(word_le(b, 6), gr), y: gyro_mdps(word_le(b, 8), gr), z: gyro_mdps(word_le(b, 10), gr) } })
+    let ar = r[0] as Int & 3
+    let gr = r[2] as Int & 7
+    Some(ImuSample { accel: AccelMilliG { x: accel_mg(word_le(b, 0), ar),
+        y: accel_mg(word_le(b, 2), ar),
+        z: accel_mg(word_le(b, 4), ar) },
+    gyro: GyroMilliDps { x: gyro_mdps(word_le(b, 6), gr),
+        y: gyro_mdps(word_le(b, 8), gr),
+        z: gyro_mdps(word_le(b, 10), gr) } })
 
 // STATUS, or `None`.  Bit 7 is the accelerometer's data-ready flag and
 // bit 6 the gyroscope's.  A flag clears when the first data register of
@@ -933,7 +945,9 @@ pub fn fifo_read_accel<L: BmiLink>(l: L, var dst: Vec[AccelMilliG; 32]) -> Int [
                 return dst.len()
             for f in 0..take
                 let o = f * size + at
-                let _ = dst.push(AccelMilliG { x: accel_mg(word_le(b, o), rc), y: accel_mg(word_le(b, o + 2), rc), z: accel_mg(word_le(b, o + 4), rc) })
+                let _ = dst.push(AccelMilliG { x: accel_mg(word_le(b, o), rc),
+                    y: accel_mg(word_le(b, o + 2), rc),
+                    z: accel_mg(word_le(b, o + 4), rc) })
             left = left - take
     dst.len()
 
@@ -1028,7 +1042,7 @@ pub fn gyro_self_test<L: BmiLink>(l: L) -> Int [hw]
     var st: DevBytes = Vec.new()
     if not l.link_read(REG_FEATURES + 8, 2, var st)
         return -1
-    if (((st[0] as Int) >> 3) & 7) != 0
+    if ((st[0] as Int >> 3) & 7) != 0
         return -3
     var mask = 0
     if (axes & 0x02) == 0
@@ -1055,7 +1069,11 @@ impl Bmi270
     // The part at `w.addr` on the board's I2C bus, as the board's device
     // table builds it.  Nothing is sent.
     fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Bmi270
-        Bmi270 { link: Bmi270Link { i2c: bus, spi: BoardSpi { id: 0 }, gpio: pins, timer: BoardTimer { id: 0 }, w: w } }
+        Bmi270 { link: Bmi270Link { i2c: bus,
+            spi: BoardSpi { id: 0 },
+            gpio: pins,
+            timer: BoardTimer { id: 0 },
+            w: w } }
 
     // The link, for the functions of this module that take one.
     fn as_link(self) -> Bmi270Link
@@ -1099,7 +1117,11 @@ impl Bmi270
 impl Bmi270Spi
     // The part selected by `w.cs` on the board's SPI bus.  Nothing is sent.
     fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Bmi270Spi
-        Bmi270Spi { link: Bmi270Link { i2c: BoardI2c { id: 0 }, spi: bus, gpio: pins, timer: BoardTimer { id: 0 }, w: w } }
+        Bmi270Spi { link: Bmi270Link { i2c: BoardI2c { id: 0 },
+            spi: bus,
+            gpio: pins,
+            timer: BoardTimer { id: 0 },
+            w: w } }
 
     // The link, for the functions of this module that take one.
     fn as_link(self) -> Bmi270Link

@@ -52,7 +52,7 @@ fn digits(n: Int, width: Int) [hw]
             w = w + 1
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes a signed number.
@@ -94,7 +94,7 @@ fn main() [hw]
                     Some(t) =>
                         hal.uart.write("  temp mC ")
                         signed(t.milli_c)
-                    None => hal.uart.write("  temp ?")
+                    None    => hal.uart.write("  temp ?")
                 hal.uart.write("\n")
-            None => hal.uart.write("no answer\n")
+            None    => hal.uart.write("no answer\n")
         hal.timer.delay_ms(100)
