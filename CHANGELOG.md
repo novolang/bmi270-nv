@@ -24,11 +24,13 @@ I2C or an SPI bus.
 - The headerless FIFO, the accelerometer's and the gyroscope's
   self-tests, and the readback of the configuration file.
 - The device program `examples/imu_reader.nv`, a reading loop. Built for the
-  nRF52840-DK it is 27,560 B of flash and for the nRF54LM20-DK 29,200 B.
-- Not verified on hardware: no board on the bench carries the chip.
-  Neither Nordic board has a driver for its two-wire interface (TWIM) at
-  this release, so the device program builds for them and finds an absent
-  bus.
+  nRF52840-DK it is 31,816 B of flash and for the nRF54LM20-DK 33,440 B.
+  When the package was written the two Nordic boards answered for I2C as
+  absent hardware and the images were 27,560 B and 29,200 B, without the
+  reading path; the TWIM drivers landed on 2026-11-10.
+- Not verified on hardware: no board on the bench carries the chip. A reply
+  from a BMI270 over the Nordic boards' TWIM buses is NOT VERIFIED until
+  the driver rig.
 - Not implemented: the auxiliary and OIS interfaces, the built-in motion
   features, the gyroscope's CRT and the offset compensation, the FIFO in
   header mode, three-wire SPI, and the async form of the traits.

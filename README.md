@@ -63,14 +63,21 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program | Of which tables and data | RAM (`.data` and `.bss`) |
 |---|---|---|---|---|
-| `nrf52840-dk` | 27,560 B | 6,820 B | 10,936 B | 2,644 B |
-| `nrf54lm20-dk` | 29,200 B | 7,452 B | 11,888 B | 2,644 B |
+| `nrf52840-dk` | 31,816 B | 8,148 B | 10,132 B | 3,748 B |
+| `nrf54lm20-dk` | 33,440 B | 8,770 B | 11,078 B | 3,748 B |
 
 The numbers are from the build's memory report. The tables hold the
 8192-byte configuration file, read-only in flash. Flash also holds the
 runtime and the compiler's support library. The arena, 65,536 B on both
 boards, is the runtime's heap and is reserved whether or not the program
-uses it. The program's effect is `[hw]`, for the I2C bus, the UART and the
+uses it. The nRF52840-DK's bus is TWIM0 on SDA P0.26 and SCL P0.27, and
+the nRF54LM20-DK's is TWIM22 on SDA P1.03 and SCL P1.04
+(`docs/hal/README.md` in the novo-lang repository, "The Nordic DKs'
+buses"), so both images carry the reading path. Before the Nordic buses
+landed on 2026-11-10 the two board packages answered for I2C as absent
+hardware, and the images were 27,560 B and 29,200 B of flash with 2,644 B
+of RAM. A reply from a BMI270 over those buses is NOT VERIFIED until the
+driver rig. The program's effect is `[hw]`, for the I2C bus, the UART and the
 timer.
 
 `BoardI2c` reaches the bus that the board's package names with
