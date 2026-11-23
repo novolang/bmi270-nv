@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.2) and devices-nv ^0.4.0 (was ^0.3.2), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+The minor moves because devices-nv 0.4.0's `GyroRange` has a value for the part's +-125 dps range, and the driver answers for it.
+
+- `gyr_range_of(4)` answers `GyroRange125dps`, as do the reserved codes 5 to 7; it answered `GyroRange250dps`.  `gyro_range` follows.
+- `gyr_range_code` answers 4 for `GyroRange125dps` and -1 for the four ranges the part does not have, `GyroRange15dps`, `GyroRange31dps`, `GyroRange62dps` and `GyroRange4000dps`.  `gyr_range_write` and the trait's `gyro_set_range` refuse those four without a bus access.
+- `gyr_range_write_125` is `gyr_range_write` with `GyroRange125dps`.
+
+The device program builds for the boards its README names, flash nrf52840-dk 26,968 B before and 26,892 B after; nrf54lm20-dk 28,448 B before and 28,372 B after; nrf52-qemu 22,800 B before and 22,724 B after.
+
 ## 0.1.0
 
 The first release: a driver for Bosch Sensortec's BMI270 six-axis IMU on an

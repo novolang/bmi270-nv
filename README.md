@@ -207,10 +207,10 @@ their first argument. The functions `i2c_read`, `i2c_write`, `spi_read`,
 8. The paired sample is one read of 12 bytes from DATA_8. The ranges are
    read in a second transaction, three bytes from ACC_RANGE, so a range
    written between the two would scale the sample wrongly.
-9. The part has +-125 dps, which `GyroRange` has no value for.
-   `gyr_range_write_125` sets it, and `gyro_range` then answers
-   `GyroRange250dps`, the narrowest value of the trait that holds it. The
-   readings are converted at 125 dps.
+9. The part has +-125 dps, which is `GyroRange125dps`; `gyro_set_range`
+   takes it and `gyro_range` answers it. `gyr_range_write_125` is the same
+   write. The ranges below 125 dps and +-4000 dps are not the part's, and
+   `gyro_set_range` refuses them without a bus access.
 10. The temperature word is signed, 512 LSB per kelvin, and 0x0000 is
     23 °C. The word 0x8000 is invalid: it is what the register holds
     until the first measurement, and `temp_read` answers `None` for it.

@@ -281,24 +281,27 @@ pub fn acc_range_of(code: Int) -> AccelRange
         2 => AccelRange8g
         _ => AccelRange16g
 
-// The code of `r` for GYR_RANGE.
+// The code of `r` for GYR_RANGE, or -1 for a range the part does not have:
+// it has +-125, 250, 500, 1000 and 2000 dps, and no range below 125 dps or
+// above 2000 dps.
 pub fn gyr_range_code(r: GyroRange) -> Int
     match r
+        GyroRange125dps  => 4
         GyroRange250dps  => 3
         GyroRange500dps  => 2
         GyroRange1000dps => 1
         GyroRange2000dps => 0
+        _                => -1
 
-// The range of a code.  The part also has +-125 dps, code 4, which
-// `GyroRange` has no value for.  The narrowest range of the trait that
-// holds it is +-250 dps, which is what 4 and the reserved codes 5 to 7
-// answer; the readings are still converted at 125 dps.
+// The range of a code.  The codes 4 to 7 answer +-125 dps: 4 is the range
+// and 5 to 7 are reserved and read as 125, the scale the readings use.
 pub fn gyr_range_of(code: Int) -> GyroRange
     match code & 7
         0 => GyroRange2000dps
         1 => GyroRange1000dps
         2 => GyroRange500dps
-        _ => GyroRange250dps
+        3 => GyroRange250dps
+        _ => GyroRange125dps
 
 // ── The link: how register bytes reach the part ──────────────────────
 
@@ -691,15 +694,19 @@ pub fn gyr_range_read<L: BmiLink>(l: L) -> ?Int [hw]
     let Some(v) = reg_get(l, REG_GYR_RANGE) else return None
     Some(v & 7)
 
-// Sets the gyroscope range; answers whether the part took it.  The
-// register's OIS range bit (bit 3) is written as 0, its reset value.
+// Sets the gyroscope range; answers whether the part took it.  A range the
+// part does not have is refused without a bus access.  The register's OIS
+// range bit (bit 3) is written as 0, its reset value.
 pub fn gyr_range_write<L: BmiLink>(l: L, r: GyroRange) -> Bool [hw]
-    reg_set(l, REG_GYR_RANGE, gyr_range_code(r))
+    let code = gyr_range_code(r)
+    if code < 0
+        return false
+    reg_set(l, REG_GYR_RANGE, code)
 
-// Sets the gyroscope range to +-125 dps, which `GyroRange` has no value
-// for (code 4).
+// Sets the gyroscope range to +-125 dps, code 4; the same as
+// `gyr_range_write` with `GyroRange125dps`.
 pub fn gyr_range_write_125<L: BmiLink>(l: L) -> Bool [hw]
-    reg_set(l, REG_GYR_RANGE, 4)
+    gyr_range_write(l, GyroRange125dps)
 
 // The accelerometer output rate in thousandths of a hertz, or -1.
 pub fn acc_rate_mhz<L: BmiLink>(l: L) -> Int [hw]

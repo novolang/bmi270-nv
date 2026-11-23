@@ -1,6 +1,6 @@
 [package]
 name        = "bmi270-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for Bosch Sensortec's BMI270 six-axis IMU on an I2C or an SPI bus: the configuration-file upload at power-up, the power modes, the accelerometer in milli-g and the gyroscope in milli-degrees per second at the range and rate set, the paired sample, the data-ready interrupts, the FIFO, the temperature and the self-tests, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable."
 license     = "Apache-2.0 AND BSD-3-Clause"
 stability   = "experimental"
@@ -20,8 +20,8 @@ tier = "embedded"
 [dependencies]
 # The board's I2C and SPI buses, GPIO and timer handles, and the
 # I2cBus, SpiBus, GpioOut and Timer traits they implement.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the Accelerometer, Gyroscope, Imu, Thermometer and
 # Identifiable traits.
-devices-nv      = "^0.3.2"
+devices-nv      = "^0.4.0"

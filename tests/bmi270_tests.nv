@@ -573,12 +573,19 @@ fn test_range_codes_both_ways() [io]
     test.assert_eq(bmi270.gyr_range_code(GyroRange1000dps), 1)
     test.assert_eq(bmi270.gyr_range_code(GyroRange500dps), 2)
     test.assert_eq(bmi270.gyr_range_code(GyroRange250dps), 3)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange125dps), 4)
+    // The ranges the part does not have have no code.
+    test.assert_eq(bmi270.gyr_range_code(GyroRange15dps), -1)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange31dps), -1)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange62dps), -1)
+    test.assert_eq(bmi270.gyr_range_code(GyroRange4000dps), -1)
     test.assert(bmi270.gyr_range_of(0) == GyroRange2000dps)
     test.assert(bmi270.gyr_range_of(1) == GyroRange1000dps)
     test.assert(bmi270.gyr_range_of(2) == GyroRange500dps)
     test.assert(bmi270.gyr_range_of(3) == GyroRange250dps)
-    // 125 dps has no value of the trait's enum; the narrowest above it.
-    test.assert(bmi270.gyr_range_of(4) == GyroRange250dps)
+    // 125 dps is code 4, and the reserved codes 5 to 7 read as 125 too.
+    test.assert(bmi270.gyr_range_of(4) == GyroRange125dps)
+    test.assert(bmi270.gyr_range_of(7) == GyroRange125dps)
 
 // ── The configuration file ───────────────────────────────────────────
 
@@ -924,6 +931,9 @@ fn test_ranges_and_rates_are_set_and_read_back() [io, hw]
     test.assert(bmi270.gyr_range_write(l, GyroRange500dps))
     test.assert_eq(bmi270.gyr_range_read(l) ?? -1, 2)
     test.assert(bmi270.gyr_range_write_125(l))
+    test.assert_eq(bmi270.gyr_range_read(l) ?? -1, 4)
+    // A range the part does not have is refused and the register keeps 125.
+    test.assert(not bmi270.gyr_range_write(l, GyroRange62dps))
     test.assert_eq(bmi270.gyr_range_read(l) ?? -1, 4)
     // The rates: the power-up 100 Hz and 200 Hz, then the slowest at or
     // above a request in the filter mode the part is in (performance).
